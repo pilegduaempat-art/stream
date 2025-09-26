@@ -1,0 +1,6 @@
+streamlit>=1.26
+aiohttp
+pandas
+numpy
+plotly
+python-dotenv
