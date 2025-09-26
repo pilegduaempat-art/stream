@@ -1,674 +1,1277 @@
-# auto_analysis_bot.py
+#!/usr/bin/env python3
+"""
+Advanced Binance Futures AI Market Analyzer Bot
+Comprehensive analysis with SMC, ICT, CMF, Pivot Points, Fibonacci
+Telegram notifications integrated
+"""
 
-import ccxt
+import asyncio
+import aiohttp
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-import streamlit as st
-import requests
+import json
+import logging
+import warnings
+import os
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from enum import Enum
 import time
-import threading
-from datetime import datetime
-# import talib  # Uncomment if talib is installed
+import math
 
-# -----------------------------
-# CONFIG
-# -----------------------------
-TELEGRAM_BOT_TOKEN = "8342042938:AAG2ZCSXYsXIu5suusoI0thZaFaurVAURvU"
-TELEGRAM_CHAT_ID = "-1002911393239"
-REFRESH_INTERVAL = 300   # 5 menit
+# Suppress warnings
+warnings.filterwarnings('ignore')
 
-# -----------------------------
-# Binance API via ccxt
-# -----------------------------
-exchange = ccxt.binance({
-    "enableRateLimit": True,
-    "options": {"defaultType": "future"}
-})
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('advanced_market_analyzer.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# -----------------------------
-# Fungsi Data
-# -----------------------------
-def get_ohlcv(symbol, timeframe="15m", limit=1000):
-    data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(data, columns=["time","open","high","low","close","volume"])
-    df["time"] = pd.to_datetime(df["time"], unit="ms")
-    return df
+class MarketSentiment(Enum):
+    BULLISH = "BULLISH"
+    BEARISH = "BEARISH"
+    NEUTRAL = "NEUTRAL"
+    VOLATILE = "VOLATILE"
 
-def get_top_volatile_pairs(limit=30):
-    tickers = exchange.fetch_tickers()
-    df = pd.DataFrame([
-        (s, t["quoteVolume"], t["percentage"])
-        for s,t in tickers.items() if s.endswith("USDT")
-    ], columns=["symbol","volume","change"])
-    df = df.sort_values("volume", ascending=False).head(30)
-    df = df.sort_values("change", key=lambda x: abs(x), ascending=False).head(limit)
-    return df["symbol"].tolist()
+class TrendStrength(Enum):
+    VERY_STRONG = "VERY_STRONG"
+    STRONG = "STRONG"
+    MODERATE = "MODERATE"
+    WEAK = "WEAK"
 
-# -----------------------------
-# Analisis Teknis Komprehensif
-# -----------------------------
-def calc_indicators(df):
-    """Kalkulasi berbagai indikator teknis"""
-    indicators = {}
+class ICTConcept(Enum):
+    BREAK_OF_STRUCTURE = "BOS"
+    CHANGE_OF_CHARACTER = "CHOCH"
+    ORDER_BLOCK = "OB"
+    FAIR_VALUE_GAP = "FVG"
+    INSTITUTIONAL_CANDLE = "INST_CANDLE"
+
+@dataclass
+class MarketSignal:
+    symbol: str
+    signal_type: str
+    strength: float
+    confidence: float
+    timestamp: datetime
+    price: float
+    target: Optional[float] = None
+    stop_loss: Optional[float] = None
+    method: str = "AI_ANALYSIS"
+
+@dataclass
+class SMCStructure:
+    """Smart Money Concepts structure"""
+    level: float
+    structure_type: str  # HH, HL, LH, LL
+    timestamp: datetime
+    broken: bool = False
+
+@dataclass
+class ICTSetup:
+    """ICT trading setup"""
+    concept: ICTConcept
+    entry_zone: Tuple[float, float]
+    target_zone: Tuple[float, float]
+    stop_loss: float
+    confidence: float
+
+@dataclass
+class FibonacciLevel:
+    """Fibonacci retracement/extension level"""
+    level: float
+    percentage: float
+    level_type: str  # "retracement" or "extension"
+
+class TelegramNotifier:
+    """Telegram notification service"""
     
-    try:
-        # RSI - Manual calculation if talib not available
-        def calc_rsi(prices, period=14):
-            delta = prices.diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-            rs = gain / loss
-            rsi = 100 - (100 / (1 + rs))
-            return rsi.iloc[-1]
+    def __init__(self):
+        self.bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
+        self.chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        self.session = None
         
-        indicators['rsi'] = calc_rsi(df['close'])
+        if not self.bot_token or not self.chat_id:
+            logger.warning("Telegram credentials not found in environment variables")
+    
+    async def __aenter__(self):
+        if self.bot_token and self.chat_id:
+            self.session = aiohttp.ClientSession()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+    
+    async def send_message(self, message: str, parse_mode: str = "HTML"):
+        """Send message to Telegram"""
+        if not self.session or not self.bot_token:
+            logger.info(f"Telegram notification: {message}")
+            return False
         
-        # Simple MACD calculation
-        exp1 = df['close'].ewm(span=12).mean()
-        exp2 = df['close'].ewm(span=26).mean()
-        macd = exp1 - exp2
-        signal = macd.ewm(span=9).mean()
-        indicators['macd'] = macd.iloc[-1]
-        indicators['macd_signal'] = signal.iloc[-1]
-        indicators['macd_histogram'] = (macd - signal).iloc[-1]
-        
-        # Bollinger Bands
-        bb_period = 20
-        bb_std = 2
-        bb_middle = df['close'].rolling(bb_period).mean()
-        bb_std_dev = df['close'].rolling(bb_period).std()
-        indicators['bb_upper'] = (bb_middle + (bb_std_dev * bb_std)).iloc[-1]
-        indicators['bb_middle'] = bb_middle.iloc[-1]
-        indicators['bb_lower'] = (bb_middle - (bb_std_dev * bb_std)).iloc[-1]
-        
-        # EMA
-        indicators['ema_20'] = df['close'].ewm(span=20).mean().iloc[-1]
-        indicators['ema_50'] = df['close'].ewm(span=50).mean().iloc[-1]
-        
-        # Simple Stochastic
-        high_14 = df['high'].rolling(14).max()
-        low_14 = df['low'].rolling(14).min()
-        k_percent = 100 * ((df['close'] - low_14) / (high_14 - low_14))
-        indicators['stoch_k'] = k_percent.iloc[-1]
-        indicators['stoch_d'] = k_percent.rolling(3).mean().iloc[-1]
-        
-        # Simple ADX approximation
-        indicators['adx'] = 25.0  # Default value
-        
-    except Exception as e:
-        print(f"Error calculating indicators: {e}")
-        # Set default values
-        indicators = {
-            'rsi': 50.0, 'macd': 0.0, 'macd_signal': 0.0, 'macd_histogram': 0.0,
-            'bb_upper': df['close'].iloc[-1] * 1.02, 'bb_middle': df['close'].iloc[-1],
-            'bb_lower': df['close'].iloc[-1] * 0.98, 'ema_20': df['close'].iloc[-1],
-            'ema_50': df['close'].iloc[-1], 'stoch_k': 50.0, 'stoch_d': 50.0, 'adx': 25.0
-        }
-    
-    return indicators
-
-def calc_pivot(df):
-    last = df.iloc[-2]
-    pivot = (last["high"]+last["low"]+last["close"])/3
-    r1 = 2*pivot - last["low"]
-    r2 = pivot + (last["high"] - last["low"])
-    r3 = last["high"] + 2*(pivot - last["low"])
-    s1 = 2*pivot - last["high"]
-    s2 = pivot - (last["high"] - last["low"])
-    s3 = last["low"] - 2*(last["high"] - pivot)
-    return {
-        'pivot': pivot, 'r1': r1, 'r2': r2, 'r3': r3,
-        's1': s1, 's2': s2, 's3': s3
-    }
-
-def calc_fibonacci(df):
-    high = df["high"].max()
-    low = df["low"].min()
-    diff = high - low
-    levels = {
-        'Fibo 23.6%': high - (diff * 0.236),
-        'Fibo 38.2%': high - (diff * 0.382),
-        'Fibo 50.0%': high - (diff * 0.5),
-        'Fibo 61.8%': high - (diff * 0.618),
-        'Fibo 78.6%': high - (diff * 0.786)
-    }
-    return levels
-
-def calc_cmf(df, period=20):
-    df = df.copy()
-    df["mfm"] = ((df["close"]-df["low"])-(df["high"]-df["close"]))/(df["high"]-df["low"]+1e-9)
-    df["mfv"] = df["mfm"]*df["volume"]
-    cmf = df["mfv"].rolling(period).sum()/df["volume"].rolling(period).sum()
-    return cmf.iloc[-1] if not cmf.empty else 0
-
-def smc_zones(df):
-    """Smart Money Concepts - Supply/Demand Zones"""
-    high_20 = df["high"].iloc[-20:].max()
-    low_20 = df["low"].iloc[-20:].min()
-    high_50 = df["high"].iloc[-50:].max()
-    low_50 = df["low"].iloc[-50:].min()
-    return {
-        'supply_zone_20': high_20,
-        'demand_zone_20': low_20,
-        'supply_zone_50': high_50,
-        'demand_zone_50': low_50
-    }
-
-def ict_analysis(df):
-    """ICT (Inner Circle Trader) Analysis"""
-    current_price = df["close"].iloc[-1]
-    prev_high = df["high"].iloc[-2]
-    prev_low = df["low"].iloc[-2]
-    
-    # Break of Structure
-    bos = "NEUTRAL"
-    if current_price > prev_high:
-        bos = "BULLISH BOS"
-    elif current_price < prev_low:
-        bos = "BEARISH BOS"
-    
-    # Market Structure
-    highs = df["high"].iloc[-10:]
-    lows = df["low"].iloc[-10:]
-    
-    if highs.iloc[-1] > highs.iloc[-2] and lows.iloc[-1] > lows.iloc[-2]:
-        structure = "BULLISH (Higher Highs & Higher Lows)"
-    elif highs.iloc[-1] < highs.iloc[-2] and lows.iloc[-1] < lows.iloc[-2]:
-        structure = "BEARISH (Lower Highs & Lower Lows)"
-    else:
-        structure = "CONSOLIDATION"
-    
-    return {'bos': bos, 'structure': structure}
-
-def analyze_momentum(indicators):
-    """Analisis momentum berdasarkan indikator"""
-    momentum_score = 0
-    signals = []
-    
-    # RSI Analysis
-    if indicators['rsi']:
-        if indicators['rsi'] > 70:
-            signals.append("🔴 RSI Overbought (>70)")
-            momentum_score -= 1
-        elif indicators['rsi'] < 30:
-            signals.append("🟢 RSI Oversold (<30)")
-            momentum_score += 1
-        elif 50 < indicators['rsi'] < 70:
-            signals.append("🟡 RSI Bullish Zone (50-70)")
-            momentum_score += 0.5
-        elif 30 < indicators['rsi'] < 50:
-            signals.append("🟡 RSI Bearish Zone (30-50)")
-            momentum_score -= 0.5
-    
-    # MACD Analysis
-    if indicators['macd'] and indicators['macd_signal']:
-        if indicators['macd'] > indicators['macd_signal']:
-            signals.append("🟢 MACD Bullish Cross")
-            momentum_score += 1
-        else:
-            signals.append("🔴 MACD Bearish Cross")
-            momentum_score -= 1
-    
-    # Stochastic Analysis
-    if indicators['stoch_k'] and indicators['stoch_d']:
-        if indicators['stoch_k'] > 80:
-            signals.append("🔴 Stochastic Overbought")
-            momentum_score -= 0.5
-        elif indicators['stoch_k'] < 20:
-            signals.append("🟢 Stochastic Oversold")
-            momentum_score += 0.5
-    
-    # ADX Trend Strength
-    if indicators['adx']:
-        if indicators['adx'] > 25:
-            signals.append(f"💪 Strong Trend (ADX: {indicators['adx']:.1f})")
-        else:
-            signals.append(f"📊 Weak Trend (ADX: {indicators['adx']:.1f})")
-    
-    return momentum_score, signals
-
-def generate_trading_signal(df, indicators, pivot_levels, smc_zones, ict_data):
-    """Generate comprehensive trading signal"""
-    current_price = df["close"].iloc[-1]
-    momentum_score, momentum_signals = analyze_momentum(indicators)
-    
-    # Determine overall signal
-    signal_strength = 0
-    recommendation = "HOLD"
-    tp_levels = []
-    sl_level = None
-    risk_reward = "N/A"
-    
-    # Price action analysis
-    if ict_data['bos'] == "BULLISH BOS" and momentum_score > 0:
-        recommendation = "STRONG BUY"
-        signal_strength = 3
-        tp_levels = [pivot_levels['r1'], pivot_levels['r2']]
-        sl_level = smc_zones['demand_zone_20']
-    elif ict_data['bos'] == "BULLISH BOS" and momentum_score >= 0:
-        recommendation = "BUY"
-        signal_strength = 2
-        tp_levels = [pivot_levels['r1']]
-        sl_level = smc_zones['demand_zone_20']
-    elif ict_data['bos'] == "BEARISH BOS" and momentum_score < 0:
-        recommendation = "STRONG SELL"
-        signal_strength = 3
-        tp_levels = [pivot_levels['s1'], pivot_levels['s2']]
-        sl_level = smc_zones['supply_zone_20']
-    elif ict_data['bos'] == "BEARISH BOS" and momentum_score <= 0:
-        recommendation = "SELL"
-        signal_strength = 2
-        tp_levels = [pivot_levels['s1']]
-        sl_level = smc_zones['supply_zone_20']
-    
-    # Calculate Risk/Reward
-    if tp_levels and sl_level:
-        potential_profit = abs(tp_levels[0] - current_price)
-        potential_loss = abs(current_price - sl_level)
-        risk_reward = f"1:{potential_profit/potential_loss:.2f}" if potential_loss > 0 else "N/A"
-    
-    return {
-        'recommendation': recommendation,
-        'signal_strength': signal_strength,
-        'tp_levels': tp_levels,
-        'sl_level': sl_level,
-        'risk_reward': risk_reward,
-        'momentum_score': momentum_score,
-        'momentum_signals': momentum_signals
-    }
-
-def format_professional_notification(symbol, timeframe, df, indicators, pivot_levels, fibs, smc_zones, ict_data, signal_data):
-    """Format notifikasi profesional dan komprehensif"""
-    current_price = df["close"].iloc[-1]
-    price_change = ((current_price - df["open"].iloc[0]) / df["open"].iloc[0]) * 100
-    volume_avg = df["volume"].rolling(20).mean().iloc[-1]
-    volume_current = df["volume"].iloc[-1]
-    volume_ratio = (volume_current / volume_avg) if volume_avg > 0 else 1
-    
-    # Header dengan emoji berdasarkan signal
-    signal_emoji = {
-        "STRONG BUY": "🚀",
-        "BUY": "📈",
-        "HOLD": "⏸️",
-        "SELL": "📉",
-        "STRONG SELL": "🔻"
-    }
-    
-    emoji = signal_emoji.get(signal_data['recommendation'], "📊")
-    
-    notification = f"""
-{emoji} <b>RUAS TRADING ANALYSIS</b> {emoji}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📊 <b>ASSET:</b> {symbol}
-⏰ <b>TIMEFRAME:</b> {timeframe}
-🕒 <b>TIMESTAMP:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-📊 <b>TRADING RECOMMENDATION:</b>
-├ Signal: <b>{signal_data['recommendation']}</b>
-├ Strength: {get_signal_strength_bar(signal_data['signal_strength'])}
-├ Entry Zone: <code>{current_price:.6f}</code>"""
-    
-    if signal_data['tp_levels']:
-        notification += f"\n├ Take Profit 1: <code>{signal_data['tp_levels'][0]:.6f}</code>"
-        if len(signal_data['tp_levels']) > 1:
-            notification += f"\n├ Take Profit 2: <code>{signal_data['tp_levels'][1]:.6f}</code>"
-    
-    if signal_data['sl_level']:
-        notification += f"\n├ Stop Loss: <code>{signal_data['sl_level']:.6f}</code>"
-    
-    notification += f"\n└ Risk/Reward: <code>{signal_data['risk_reward']}</code>"
-    
-    notification += f"""
-
-💰 <b>PRICE ACTION:</b>
-├ Current Price: <code>{current_price:.6f}</code>
-├ 24h Change: <code>{price_change:+.2f}%</code>
-├ Volume Ratio: <code>{volume_ratio:.2f}x</code>
-└ Market Structure: {ict_data['structure']}
-
-📈 <b>TECHNICAL INDICATORS:</b>
-├ RSI(14): <code>{indicators['rsi']:.2f}</code> {get_rsi_status(indicators['rsi'])}
-├ MACD: <code>{indicators['macd']:.6f}</code>
-├ MACD Signal: <code>{indicators['macd_signal']:.6f}</code>
-├ Stochastic K: <code>{indicators['stoch_k']:.2f}</code>
-├ ADX: <code>{indicators['adx']:.2f}</code>
-└ CMF: <code>{calc_cmf(df):.4f}</code>
-
-🎯 <b>PIVOT POINTS:</b>
-├ R3: <code>{pivot_levels['r3']:.6f}</code>
-├ R2: <code>{pivot_levels['r2']:.6f}</code>
-├ R1: <code>{pivot_levels['r1']:.6f}</code> 🔴
-├ PP: <code>{pivot_levels['pivot']:.6f}</code> ⚪
-├ S1: <code>{pivot_levels['s1']:.6f}</code> 🟢
-├ S2: <code>{pivot_levels['s2']:.6f}</code>
-└ S3: <code>{pivot_levels['s3']:.6f}</code>
-
-🔄 <b>FIBONACCI RETRACEMENTS:</b>
-├ 23.6%: <code>{fibs['Fibo 23.6%']:.6f}</code>
-├ 38.2%: <code>{fibs['Fibo 38.2%']:.6f}</code>
-├ 50.0%: <code>{fibs['Fibo 50.0%']:.6f}</code>
-├ 61.8%: <code>{fibs['Fibo 61.8%']:.6f}</code>
-└ 78.6%: <code>{fibs['Fibo 78.6%']:.6f}</code>
-
-🧠 <b>SMART MONEY CONCEPTS:</b>
-├ Supply Zone (20): <code>{smc_zones['supply_zone_20']:.6f}</code>
-├ Demand Zone (20): <code>{smc_zones['demand_zone_20']:.6f}</code>
-└ BOS Status: {ict_data['bos']}
-
-⚡ <b>MOMENTUM ANALYSIS:</b>
-├ Score: <code>{signal_data['momentum_score']:+.1f}/3.0</code>
-└ Signals:"""
-    
-    # Add momentum signals
-    for signal in signal_data['momentum_signals'][:5]:  # Limit to 5 signals
-        notification += f"\n   • {signal}"
-    
-    notification += f"""
-
-⚠️ <b>RISK MANAGEMENT:</b>
-├ Position Size: Max 2% of portfolio
-├ Leverage: Max 3x (Conservative)
-└ Time Horizon: {get_time_horizon(timeframe)}
-
-📝 <b>MARKET NOTES:</b>
-├ Volatility: {get_volatility_level(df)}
-├ Trend Direction: {get_trend_direction(indicators)}
-└ Support/Resistance: {get_nearest_sr(current_price, pivot_levels)}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚡ <i>Automated Analysis by RUAS-TradingBot v2.0</i>
-🤖 <i>This is not financial advice. DYOR!</i>
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-    
-    return notification
-
-def get_rsi_status(rsi):
-    if rsi >= 70: return "🔴 OVERBOUGHT"
-    elif rsi <= 30: return "🟢 OVERSOLD"
-    elif rsi >= 60: return "🟡 BULLISH"
-    elif rsi <= 40: return "🟡 BEARISH"
-    else: return "⚪ NEUTRAL"
-
-def get_signal_strength_bar(strength):
-    bars = "█" * strength + "░" * (3 - strength)
-    return f"[{bars}] {strength}/3"
-
-def get_time_horizon(timeframe):
-    horizons = {
-        "1m": "Scalping (1-5 min)",
-        "5m": "Scalping (5-15 min)",
-        "15m": "Day Trading (1-4 hours)",
-        "1h": "Swing (4-24 hours)",
-        "4h": "Position (1-7 days)"
-    }
-    return horizons.get(timeframe, "Medium-term")
-
-def get_volatility_level(df):
-    # Simple ATR calculation
-    tr1 = df['high'] - df['low']
-    tr2 = abs(df['high'] - df['close'].shift())
-    tr3 = abs(df['low'] - df['close'].shift())
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean().iloc[-1]
-    
-    price = df['close'].iloc[-1]
-    volatility_pct = (atr / price) * 100
-    
-    if volatility_pct > 5: return "🔥 VERY HIGH"
-    elif volatility_pct > 3: return "📈 HIGH"
-    elif volatility_pct > 1.5: return "📊 MODERATE"
-    else: return "😴 LOW"
-
-def get_trend_direction(indicators):
-    if indicators['ema_20'] > indicators['ema_50']:
-        return "📈 UPTREND"
-    elif indicators['ema_20'] < indicators['ema_50']:
-        return "📉 DOWNTREND"
-    else:
-        return "➡️ SIDEWAYS"
-
-def get_nearest_sr(price, pivots):
-    resistance = min([p for p in [pivots['r1'], pivots['r2'], pivots['r3']] if p > price], default=pivots['r1'])
-    support = max([p for p in [pivots['s1'], pivots['s2'], pivots['s3']] if p < price], default=pivots['s1'])
-    return f"S: {support:.6f} | R: {resistance:.6f}"
-
-def generate_analysis(symbol, timeframe="5m"):
-    """Generate komprehensif analysis"""
-    df = get_ohlcv(symbol, timeframe)
-    indicators = calc_indicators(df)
-    pivot_levels = calc_pivot(df)
-    fibs = calc_fibonacci(df)
-    smc_zones_data = smc_zones(df)
-    ict_data = ict_analysis(df)
-    signal_data = generate_trading_signal(df, indicators, pivot_levels, smc_zones_data, ict_data)
-    
-    # Format notification
-    notification = format_professional_notification(
-        symbol, timeframe, df, indicators, pivot_levels, fibs, 
-        smc_zones_data, ict_data, signal_data
-    )
-    
-    return df, notification, signal_data, pivot_levels, fibs
-
-# -----------------------------
-# Chart (unchanged)
-# -----------------------------
-def plot_chart(df, smc_high, smc_low, fibs, pivot, r1, s1):
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=df["time"], open=df["open"], high=df["high"],
-        low=df["low"], close=df["close"], name="Candles"
-    ))
-    fig.add_hline(y=smc_high, line=dict(color="red", dash="dash"), annotation_text="SMC Supply")
-    fig.add_hline(y=smc_low, line=dict(color="green", dash="dash"), annotation_text="SMC Demand")
-    for name, lvl in fibs.items():
-        fig.add_hline(y=lvl, line=dict(color="blue", dash="dot"), annotation_text=name)
-    fig.add_hline(y=pivot, line=dict(color="orange"), annotation_text="Pivot")
-    fig.add_hline(y=r1, line=dict(color="purple", dash="dash"), annotation_text="R1")
-    fig.add_hline(y=s1, line=dict(color="purple", dash="dash"), annotation_text="S1")
-    return fig
-
-# -----------------------------
-# Telegram
-# -----------------------------
-def clean_telegram_html(text):
-    """Clean and validate HTML for Telegram"""
-    # Ensure proper HTML tags are closed and valid
-    import re
-    
-    # Remove any malformed tags
-    text = re.sub(r'<(?!/?(?:b|i|u|s|code|pre|a)[>\s])[^>]*>', '', text)
-    
-    # Ensure all tags are properly closed
-    open_tags = re.findall(r'<(b|i|u|s|code|pre)(?:\s[^>]*)?>', text)
-    close_tags = re.findall(r'</(b|i|u|s|code|pre)>', text)
-    
-    # Balance tags if needed
-    for tag in open_tags:
-        if open_tags.count(tag) > close_tags.count(tag):
-            text += f'</{tag}>'
-    
-    return text
-
-def send_telegram(msg):
-    """Send message to Telegram with better error handling"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    
-    # Clean HTML formatting
-    msg = clean_telegram_html(msg)
-    
-    try:
-        # Split message if too long (Telegram limit 4096 chars)
-        if len(msg) > 4000:
-            # Split at line breaks to avoid cutting important info
-            lines = msg.split('\n')
-            current_chunk = ""
+        try:
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            payload = {
+                "chat_id": self.chat_id,
+                "text": message,
+                "parse_mode": parse_mode
+            }
             
-            for line in lines:
-                if len(current_chunk + line + '\n') > 4000:
-                    if current_chunk:
-                        response = requests.post(url, json={
-                            "chat_id": TELEGRAM_CHAT_ID, 
-                            "text": current_chunk, 
-                            "parse_mode": "HTML",
-                            "disable_web_page_preview": True
-                        })
-                        print(f"Telegram Response: {response.status_code}")
-                        time.sleep(1)  # Avoid rate limit
-                    current_chunk = line + '\n'
+            async with self.session.post(url, json=payload) as response:
+                if response.status == 200:
+                    logger.info("Telegram notification sent successfully")
+                    return True
                 else:
-                    current_chunk += line + '\n'
+                    logger.error(f"Failed to send Telegram notification: {response.status}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Error sending Telegram notification: {e}")
+            return False
+
+class AdvancedTechnicalAnalyzer:
+    """Advanced technical analysis without TA-Lib dependency"""
+    
+    @staticmethod
+    def sma(data: np.ndarray, period: int) -> np.ndarray:
+        """Simple Moving Average"""
+        return pd.Series(data).rolling(window=period).mean().values
+    
+    @staticmethod
+    def ema(data: np.ndarray, period: int) -> np.ndarray:
+        """Exponential Moving Average"""
+        return pd.Series(data).ewm(span=period).mean().values
+    
+    @staticmethod
+    def rsi(data: np.ndarray, period: int = 14) -> np.ndarray:
+        """Relative Strength Index"""
+        delta = pd.Series(data).diff()
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        avg_gain = gain.rolling(window=period).mean()
+        avg_loss = loss.rolling(window=period).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.values
+    
+    @staticmethod
+    def macd(data: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """MACD Indicator"""
+        ema_fast = AdvancedTechnicalAnalyzer.ema(data, fast)
+        ema_slow = AdvancedTechnicalAnalyzer.ema(data, slow)
+        macd = ema_fast - ema_slow
+        macd_signal = AdvancedTechnicalAnalyzer.ema(macd, signal)
+        macd_hist = macd - macd_signal
+        return macd, macd_signal, macd_hist
+    
+    @staticmethod
+    def bollinger_bands(data: np.ndarray, period: int = 20, std_dev: float = 2) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Bollinger Bands"""
+        sma = AdvancedTechnicalAnalyzer.sma(data, period)
+        std = pd.Series(data).rolling(window=period).std().values
+        upper = sma + (std * std_dev)
+        lower = sma - (std * std_dev)
+        return upper, sma, lower
+    
+    @staticmethod
+    def atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+        """Average True Range"""
+        high_low = high - low
+        high_close = np.abs(high - np.roll(close, 1))
+        low_close = np.abs(low - np.roll(close, 1))
+        tr = np.maximum(high_low, np.maximum(high_close, low_close))
+        return pd.Series(tr).rolling(window=period).mean().values
+    
+    @staticmethod
+    def stochastic(high: np.ndarray, low: np.ndarray, close: np.ndarray, k_period: int = 14, d_period: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+        """Stochastic Oscillator"""
+        lowest_low = pd.Series(low).rolling(window=k_period).min()
+        highest_high = pd.Series(high).rolling(window=k_period).max()
+        k_percent = 100 * ((pd.Series(close) - lowest_low) / (highest_high - lowest_low))
+        d_percent = k_percent.rolling(window=d_period).mean()
+        return k_percent.values, d_percent.values
+    
+    @staticmethod
+    def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+        """Average Directional Index"""
+        plus_dm = pd.Series(high).diff()
+        minus_dm = pd.Series(low).diff() * -1
+        
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm < 0] = 0
+        
+        tr = AdvancedTechnicalAnalyzer.atr(high, low, close, 1)
+        plus_di = 100 * (plus_dm.rolling(window=period).mean() / pd.Series(tr).rolling(window=period).mean())
+        minus_di = 100 * (minus_dm.rolling(window=period).mean() / pd.Series(tr).rolling(window=period).mean())
+        
+        dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx = dx.rolling(window=period).mean()
+        return adx.values
+    
+    @staticmethod
+    def cmf(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, period: int = 20) -> np.ndarray:
+        """Chaikin Money Flow"""
+        mf_multiplier = ((close - low) - (high - close)) / (high - low)
+        mf_multiplier = np.nan_to_num(mf_multiplier)
+        mf_volume = mf_multiplier * volume
+        
+        cmf = pd.Series(mf_volume).rolling(window=period).sum() / pd.Series(volume).rolling(window=period).sum()
+        return cmf.values
+
+class SMCAnalyzer:
+    """Smart Money Concepts Analyzer"""
+    
+    @staticmethod
+    def identify_market_structure(df: pd.DataFrame) -> List[SMCStructure]:
+        """Identify market structure points (HH, HL, LH, LL)"""
+        structures = []
+        
+        try:
+            # Find local highs and lows
+            highs = df['high'].rolling(window=5, center=True).max()
+            lows = df['low'].rolling(window=5, center=True).min()
             
-            # Send remaining chunk
-            if current_chunk:
-                response = requests.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID, 
-                    "text": current_chunk, 
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True
-                })
-                print(f"Telegram Response: {response.status_code}")
-        else:
-            response = requests.post(url, json={
-                "chat_id": TELEGRAM_CHAT_ID, 
-                "text": msg, 
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True
-            })
-            print(f"Telegram Response: {response.status_code}")
+            high_points = []
+            low_points = []
             
-            # If HTML parsing fails, try with plain text
-            if response.status_code != 200:
-                print("HTML parsing failed, trying plain text...")
-                # Remove all HTML tags for plain text fallback
-                import re
-                plain_msg = re.sub(r'<[^>]+>', '', msg)
-                response = requests.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID, 
-                    "text": plain_msg
-                })
-                print(f"Plain text Response: {response.status_code}")
+            for i in range(len(df)):
+                if df['high'].iloc[i] == highs.iloc[i] and not pd.isna(highs.iloc[i]):
+                    high_points.append((i, df['high'].iloc[i], df.index[i]))
+                if df['low'].iloc[i] == lows.iloc[i] and not pd.isna(lows.iloc[i]):
+                    low_points.append((i, df['low'].iloc[i], df.index[i]))
+            
+            # Classify structure points
+            for i in range(1, len(high_points)):
+                current_high = high_points[i][1]
+                prev_high = high_points[i-1][1]
                 
+                structure_type = "HH" if current_high > prev_high else "LH"
+                structure = SMCStructure(
+                    level=current_high,
+                    structure_type=structure_type,
+                    timestamp=high_points[i][2]
+                )
+                structures.append(structure)
+            
+            for i in range(1, len(low_points)):
+                current_low = low_points[i][1]
+                prev_low = low_points[i-1][1]
+                
+                structure_type = "HL" if current_low > prev_low else "LL"
+                structure = SMCStructure(
+                    level=current_low,
+                    structure_type=structure_type,
+                    timestamp=low_points[i][2]
+                )
+                structures.append(structure)
+            
+            return sorted(structures, key=lambda x: x.timestamp)[-10:]  # Return last 10 structures
+            
+        except Exception as e:
+            logger.error(f"Error identifying market structure: {e}")
+            return []
+    
+    @staticmethod
+    def identify_order_blocks(df: pd.DataFrame) -> List[Dict]:
+        """Identify institutional order blocks"""
+        order_blocks = []
+        
+        try:
+            for i in range(2, len(df) - 2):
+                current = df.iloc[i]
+                prev = df.iloc[i-1]
+                next_candle = df.iloc[i+1]
+                
+                # Bullish order block: strong move up after consolidation
+                if (current['close'] > current['open'] and 
+                    (current['close'] - current['open']) / current['open'] > 0.02 and
+                    current['volume'] > df['volume'].rolling(20).mean().iloc[i] * 1.5):
+                    
+                    order_blocks.append({
+                        'type': 'bullish_ob',
+                        'high': current['high'],
+                        'low': current['low'],
+                        'timestamp': df.index[i],
+                        'strength': (current['close'] - current['open']) / current['open']
+                    })
+                
+                # Bearish order block: strong move down after consolidation
+                elif (current['close'] < current['open'] and
+                      (current['open'] - current['close']) / current['open'] > 0.02 and
+                      current['volume'] > df['volume'].rolling(20).mean().iloc[i] * 1.5):
+                    
+                    order_blocks.append({
+                        'type': 'bearish_ob',
+                        'high': current['high'],
+                        'low': current['low'],
+                        'timestamp': df.index[i],
+                        'strength': (current['open'] - current['close']) / current['open']
+                    })
+            
+            return order_blocks[-5:]  # Return last 5 order blocks
+            
+        except Exception as e:
+            logger.error(f"Error identifying order blocks: {e}")
+            return []
+    
+    @staticmethod
+    def identify_fair_value_gaps(df: pd.DataFrame) -> List[Dict]:
+        """Identify Fair Value Gaps (FVGs)"""
+        fvgs = []
+        
+        try:
+            for i in range(1, len(df) - 1):
+                prev_candle = df.iloc[i-1]
+                current = df.iloc[i]
+                next_candle = df.iloc[i+1]
+                
+                # Bullish FVG: gap between previous low and next high
+                if (prev_candle['low'] > next_candle['high'] and
+                    current['close'] > current['open']):
+                    
+                    fvgs.append({
+                        'type': 'bullish_fvg',
+                        'upper': prev_candle['low'],
+                        'lower': next_candle['high'],
+                        'timestamp': df.index[i],
+                        'filled': False
+                    })
+                
+                # Bearish FVG: gap between previous high and next low
+                elif (prev_candle['high'] < next_candle['low'] and
+                      current['close'] < current['open']):
+                    
+                    fvgs.append({
+                        'type': 'bearish_fvg',
+                        'upper': next_candle['low'],
+                        'lower': prev_candle['high'],
+                        'timestamp': df.index[i],
+                        'filled': False
+                    })
+            
+            return fvgs[-3:]  # Return last 3 FVGs
+            
+        except Exception as e:
+            logger.error(f"Error identifying FVGs: {e}")
+            return []
+
+class ICTAnalyzer:
+    """Inner Circle Trader concepts analyzer"""
+    
+    @staticmethod
+    def identify_break_of_structure(df: pd.DataFrame, structures: List[SMCStructure]) -> List[Dict]:
+        """Identify Break of Structure (BOS)"""
+        bos_signals = []
+        
+        try:
+            current_price = df['close'].iloc[-1]
+            
+            for structure in structures[-5:]:  # Check recent structures
+                if structure.structure_type in ['HH', 'LH'] and current_price > structure.level:
+                    bos_signals.append({
+                        'type': 'bullish_bos',
+                        'level_broken': structure.level,
+                        'structure_type': structure.structure_type,
+                        'confirmation_price': current_price,
+                        'timestamp': datetime.now()
+                    })
+                elif structure.structure_type in ['LL', 'HL'] and current_price < structure.level:
+                    bos_signals.append({
+                        'type': 'bearish_bos',
+                        'level_broken': structure.level,
+                        'structure_type': structure.structure_type,
+                        'confirmation_price': current_price,
+                        'timestamp': datetime.now()
+                    })
+            
+            return bos_signals
+            
+        except Exception as e:
+            logger.error(f"Error identifying BOS: {e}")
+            return []
+    
+    @staticmethod
+    def identify_change_of_character(df: pd.DataFrame) -> List[Dict]:
+        """Identify Change of Character (CHOCH)"""
+        choch_signals = []
+        
+        try:
+            # Look for momentum divergences and trend changes
+            recent_data = df.tail(20)
+            
+            # Calculate momentum using price changes
+            momentum = recent_data['close'].pct_change(5)
+            
+            # Identify potential CHOCH points
+            for i in range(5, len(recent_data) - 1):
+                if (momentum.iloc[i] < -0.02 and momentum.iloc[i-1] > 0.01):  # Bullish to bearish
+                    choch_signals.append({
+                        'type': 'bearish_choch',
+                        'price': recent_data['close'].iloc[i],
+                        'timestamp': recent_data.index[i],
+                        'momentum_change': momentum.iloc[i] - momentum.iloc[i-1]
+                    })
+                elif (momentum.iloc[i] > 0.02 and momentum.iloc[i-1] < -0.01):  # Bearish to bullish
+                    choch_signals.append({
+                        'type': 'bullish_choch',
+                        'price': recent_data['close'].iloc[i],
+                        'timestamp': recent_data.index[i],
+                        'momentum_change': momentum.iloc[i] - momentum.iloc[i-1]
+                    })
+            
+            return choch_signals
+            
+        except Exception as e:
+            logger.error(f"Error identifying CHOCH: {e}")
+            return []
+
+class PivotPointAnalyzer:
+    """Pivot Point analysis"""
+    
+    @staticmethod
+    def calculate_pivot_points(high: float, low: float, close: float) -> Dict[str, float]:
+        """Calculate traditional pivot points"""
+        try:
+            pivot = (high + low + close) / 3
+            
+            # Support and Resistance levels
+            r1 = 2 * pivot - low
+            s1 = 2 * pivot - high
+            r2 = pivot + (high - low)
+            s2 = pivot - (high - low)
+            r3 = high + 2 * (pivot - low)
+            s3 = low - 2 * (high - pivot)
+            
+            return {
+                'pivot': pivot,
+                'r1': r1, 'r2': r2, 'r3': r3,
+                's1': s1, 's2': s2, 's3': s3
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculating pivot points: {e}")
+            return {}
+    
+    @staticmethod
+    def calculate_fibonacci_levels(high: float, low: float, trend: str = 'uptrend') -> List[FibonacciLevel]:
+        """Calculate Fibonacci retracement levels"""
+        try:
+            levels = []
+            fib_ratios = [0.0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0]
+            
+            range_val = high - low
+            
+            for ratio in fib_ratios:
+                if trend == 'uptrend':
+                    level = high - (range_val * ratio)
+                else:
+                    level = low + (range_val * ratio)
+                
+                levels.append(FibonacciLevel(
+                    level=level,
+                    percentage=ratio * 100,
+                    level_type='retracement'
+                ))
+            
+            # Extension levels
+            extension_ratios = [1.272, 1.414, 1.618, 2.0]
+            for ratio in extension_ratios:
+                if trend == 'uptrend':
+                    level = high + (range_val * (ratio - 1))
+                else:
+                    level = low - (range_val * (ratio - 1))
+                
+                levels.append(FibonacciLevel(
+                    level=level,
+                    percentage=ratio * 100,
+                    level_type='extension'
+                ))
+            
+            return levels
+            
+        except Exception as e:
+            logger.error(f"Error calculating Fibonacci levels: {e}")
+            return []
+
+class BinanceFuturesAPI:
+    """Binance Futures API client for real-time data"""
+    
+    BASE_URL = "https://fapi.binance.com"
+    
+    def __init__(self):
+        self.session = None
+    
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+    
+    async def get_klines(self, symbol: str, interval: str = "1h", limit: int = 500) -> List:
+        """Get kline/candlestick data"""
+        url = f"{self.BASE_URL}/fapi/v1/klines"
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        }
+        async with self.session.get(url, params=params) as response:
+            return await response.json()
+    
+    async def get_24hr_ticker(self, symbol: str = None) -> Dict:
+        """Get 24hr ticker price change statistics"""
+        url = f"{self.BASE_URL}/fapi/v1/ticker/24hr"
+        params = {"symbol": symbol} if symbol else {}
+        async with self.session.get(url, params=params) as response:
+            return await response.json()
+    
+    async def get_funding_rate(self, symbol: str = None) -> Dict:
+        """Get current funding rate"""
+        url = f"{self.BASE_URL}/fapi/v1/premiumIndex"
+        params = {"symbol": symbol} if symbol else {}
+        async with self.session.get(url, params=params) as response:
+            return await response.json()
+
+class AdvancedAIMarketAnalyzer:
+    """Advanced AI-powered market analyzer with SMC, ICT, CMF concepts"""
+    
+    def __init__(self):
+        self.tech_analyzer = AdvancedTechnicalAnalyzer()
+        self.smc_analyzer = SMCAnalyzer()
+        self.ict_analyzer = ICTAnalyzer()
+        self.pivot_analyzer = PivotPointAnalyzer()
+        self.api = None
+        self.notifier = None
+    
+    async def initialize(self):
+        """Initialize API connection and notifier"""
+        self.api = BinanceFuturesAPI()
+        await self.api.__aenter__()
+        
+        self.notifier = TelegramNotifier()
+        await self.notifier.__aenter__()
+    
+    async def cleanup(self):
+        """Cleanup resources"""
+        if self.api:
+            await self.api.__aexit__(None, None, None)
+        if self.notifier:
+            await self.notifier.__aexit__(None, None, None)
+    
+    def calculate_comprehensive_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate all technical indicators without TA-Lib"""
+        try:
+            high = df['high'].values
+            low = df['low'].values
+            close = df['close'].values
+            volume = df['volume'].values
+            
+            # Moving Averages
+            df['sma_20'] = self.tech_analyzer.sma(close, 20)
+            df['sma_50'] = self.tech_analyzer.sma(close, 50)
+            df['ema_12'] = self.tech_analyzer.ema(close, 12)
+            df['ema_26'] = self.tech_analyzer.ema(close, 26)
+            
+            # MACD
+            df['macd'], df['macd_signal'], df['macd_hist'] = self.tech_analyzer.macd(close)
+            
+            # RSI
+            df['rsi'] = self.tech_analyzer.rsi(close, 14)
+            
+            # Bollinger Bands
+            df['bb_upper'], df['bb_middle'], df['bb_lower'] = self.tech_analyzer.bollinger_bands(close)
+            
+            # Stochastic
+            df['stoch_k'], df['stoch_d'] = self.tech_analyzer.stochastic(high, low, close)
+            
+            # ADX
+            df['adx'] = self.tech_analyzer.adx(high, low, close)
+            
+            # ATR
+            df['atr'] = self.tech_analyzer.atr(high, low, close)
+            
+            # CMF - Chaikin Money Flow
+            df['cmf'] = self.tech_analyzer.cmf(high, low, close, volume)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error calculating indicators: {e}")
+            return df
+    
+    def ai_sentiment_analysis(self, df: pd.DataFrame, smc_data: Dict, ict_data: Dict) -> MarketSentiment:
+        """Advanced AI sentiment analysis incorporating SMC and ICT"""
+        try:
+            latest = df.iloc[-1]
+            
+            # Technical sentiment score
+            tech_score = 0
+            
+            # RSI analysis
+            if latest['rsi'] > 70:
+                tech_score -= 2
+            elif latest['rsi'] < 30:
+                tech_score += 2
+            elif 40 < latest['rsi'] < 60:
+                tech_score += 1
+            
+            # MACD analysis
+            if latest['macd'] > latest['macd_signal']:
+                tech_score += 1
+            else:
+                tech_score -= 1
+            
+            # Moving average analysis
+            if latest['close'] > latest['sma_20'] > latest['sma_50']:
+                tech_score += 2
+            elif latest['close'] < latest['sma_20'] < latest['sma_50']:
+                tech_score -= 2
+            
+            # CMF analysis
+            if latest['cmf'] > 0.2:
+                tech_score += 1
+            elif latest['cmf'] < -0.2:
+                tech_score -= 1
+            
+            # SMC analysis
+            smc_score = 0
+            order_blocks = smc_data.get('order_blocks', [])
+            for ob in order_blocks:
+                if ob['type'] == 'bullish_ob':
+                    smc_score += 1
+                else:
+                    smc_score -= 1
+            
+            # ICT analysis
+            ict_score = 0
+            bos_signals = ict_data.get('bos_signals', [])
+            for bos in bos_signals:
+                if bos['type'] == 'bullish_bos':
+                    ict_score += 2
+                else:
+                    ict_score -= 2
+            
+            # Combined AI score
+            total_score = tech_score + smc_score + ict_score
+            
+            # Volatility check
+            volatility = latest['atr'] / latest['close'] * 100
+            if volatility > 5:
+                return MarketSentiment.VOLATILE
+            
+            # Sentiment classification
+            if total_score >= 3:
+                return MarketSentiment.BULLISH
+            elif total_score <= -3:
+                return MarketSentiment.BEARISH
+            else:
+                return MarketSentiment.NEUTRAL
+                
+        except Exception as e:
+            logger.error(f"Error in AI sentiment analysis: {e}")
+            return MarketSentiment.NEUTRAL
+    
+    def generate_advanced_signals(self, df: pd.DataFrame, symbol: str, smc_data: Dict, ict_data: Dict, pivot_data: Dict) -> List[MarketSignal]:
+        """Generate advanced trading signals"""
+        signals = []
+        
+        try:
+            latest = df.iloc[-1]
+            current_price = latest['close']
+            
+            # SMC Order Block Signal
+            order_blocks = smc_data.get('order_blocks', [])
+            for ob in order_blocks:
+                if (ob['type'] == 'bullish_ob' and 
+                    ob['low'] <= current_price <= ob['high'] and
+                    latest['close'] > latest['open']):
+                    
+                    signal = MarketSignal(
+                        symbol=symbol,
+                        signal_type="SMC_BULLISH_ORDER_BLOCK",
+                        strength=ob['strength'],
+                        confidence=0.8,
+                        timestamp=datetime.now(),
+                        price=current_price,
+                        target=current_price * 1.025,
+                        stop_loss=ob['low'],
+                        method="SMC_ANALYSIS"
+                    )
+                    signals.append(signal)
+            
+            # ICT Break of Structure Signal
+            bos_signals = ict_data.get('bos_signals', [])
+            for bos in bos_signals:
+                if bos['type'] == 'bullish_bos':
+                    signal = MarketSignal(
+                        symbol=symbol,
+                        signal_type="ICT_BULLISH_BOS",
+                        strength=0.8,
+                        confidence=0.85,
+                        timestamp=datetime.now(),
+                        price=current_price,
+                        target=current_price * 1.03,
+                        stop_loss=bos['level_broken'],
+                        method="ICT_ANALYSIS"
+                    )
+                    signals.append(signal)
+            
+            # Fibonacci + CMF Signal
+            if latest['cmf'] > 0.1 and latest['rsi'] > 50:
+                fib_levels = pivot_data.get('fibonacci', [])
+                for fib in fib_levels:
+                    if (fib.level_type == 'retracement' and 
+                        fib.percentage == 61.8 and
+                        abs(current_price - fib.level) / current_price < 0.005):
+                        
+                        signal = MarketSignal(
+                            symbol=symbol,
+                            signal_type="FIBONACCI_CMF_CONFLUENCE",
+                            strength=0.75,
+                            confidence=0.7,
+                            timestamp=datetime.now(),
+                            price=current_price,
+                            target=current_price * 1.02,
+                            stop_loss=current_price * 0.985,
+                            method="FIBONACCI_CMF"
+                        )
+                        signals.append(signal)
+                        break
+            
+            # Pivot Point Breakout Signal
+            pivot_points = pivot_data.get('pivot_points', {})
+            if pivot_points:
+                if current_price > pivot_points.get('r1', 0) and latest['volume'] > df['volume'].rolling(20).mean().iloc[-1]:
+                    signal = MarketSignal(
+                        symbol=symbol,
+                        signal_type="PIVOT_RESISTANCE_BREAKOUT",
+                        strength=0.7,
+                        confidence=0.75,
+                        timestamp=datetime.now(),
+                        price=current_price,
+                        target=pivot_points.get('r2', current_price * 1.02),
+                        stop_loss=pivot_points.get('pivot', current_price * 0.99),
+                        method="PIVOT_ANALYSIS"
+                    )
+                    signals.append(signal)
+                elif current_price < pivot_points.get('s1', 0) and latest['volume'] > df['volume'].rolling(20).mean().iloc[-1]:
+                    signal = MarketSignal(
+                        symbol=symbol,
+                        signal_type="PIVOT_SUPPORT_BREAKDOWN",
+                        strength=0.7,
+                        confidence=0.75,
+                        timestamp=datetime.now(),
+                        price=current_price,
+                        target=pivot_points.get('s2', current_price * 0.98),
+                        stop_loss=pivot_points.get('pivot', current_price * 1.01),
+                        method="PIVOT_ANALYSIS"
+                    )
+                    signals.append(signal)
+            
+            return signals
+            
+        except Exception as e:
+            logger.error(f"Error generating advanced signals: {e}")
+            return []
+    
+    async def comprehensive_symbol_analysis(self, symbol: str) -> Dict:
+        """Comprehensive analysis of a symbol with all advanced concepts"""
+        try:
+            # Get market data
+            klines = await self.api.get_klines(symbol, "1h", 200)
+            ticker_data = await self.api.get_24hr_ticker(symbol)
+            funding_data = await self.api.get_funding_rate(symbol)
+            
+            # Process klines data
+            df = pd.DataFrame(klines, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_asset_volume', 'number_of_trades',
+                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+            ])
+            
+            # Convert to numeric
+            numeric_columns = ['open', 'high', 'low', 'close', 'volume']
+            for col in numeric_columns:
+                df[col] = pd.to_numeric(df[col])
+            
+            # Convert timestamp to datetime
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            
+            # Calculate technical indicators
+            df = self.calculate_comprehensive_indicators(df)
+            
+            # SMC Analysis
+            structures = self.smc_analyzer.identify_market_structure(df)
+            order_blocks = self.smc_analyzer.identify_order_blocks(df)
+            fvgs = self.smc_analyzer.identify_fair_value_gaps(df)
+            
+            smc_data = {
+                'structures': structures,
+                'order_blocks': order_blocks,
+                'fair_value_gaps': fvgs
+            }
+            
+            # ICT Analysis
+            bos_signals = self.ict_analyzer.identify_break_of_structure(df, structures)
+            choch_signals = self.ict_analyzer.identify_change_of_character(df)
+            
+            ict_data = {
+                'bos_signals': bos_signals,
+                'choch_signals': choch_signals
+            }
+            
+            # Pivot Points and Fibonacci
+            recent_data = df.tail(1).iloc[0]
+            pivot_points = self.pivot_analyzer.calculate_pivot_points(
+                recent_data['high'], recent_data['low'], recent_data['close']
+            )
+            
+            # Determine trend for Fibonacci
+            trend = 'uptrend' if recent_data['close'] > df['sma_50'].iloc[-1] else 'downtrend'
+            high_period = df['high'].rolling(20).max().iloc[-1]
+            low_period = df['low'].rolling(20).min().iloc[-1]
+            fibonacci_levels = self.pivot_analyzer.calculate_fibonacci_levels(high_period, low_period, trend)
+            
+            pivot_data = {
+                'pivot_points': pivot_points,
+                'fibonacci': fibonacci_levels
+            }
+            
+            # AI Sentiment Analysis
+            sentiment = self.ai_sentiment_analysis(df, smc_data, ict_data)
+            
+            # Generate advanced signals
+            signals = self.generate_advanced_signals(df, symbol, smc_data, ict_data, pivot_data)
+            
+            # Calculate risk metrics
+            latest = df.iloc[-1]
+            volatility = latest['atr'] / latest['close'] * 100
+            momentum_20 = (latest['close'] - df['close'].iloc[-20]) / df['close'].iloc[-20] * 100
+            
+            # Calculate AI confidence score
+            confidence_factors = []
+            
+            # Volume confirmation
+            avg_volume = df['volume'].rolling(20).mean().iloc[-1]
+            if latest['volume'] > avg_volume:
+                confidence_factors.append(0.1)
+            
+            # Multiple timeframe alignment (simulated)
+            if latest['sma_20'] > latest['sma_50']:
+                confidence_factors.append(0.1)
+            
+            # CMF confirmation
+            if abs(latest['cmf']) > 0.1:
+                confidence_factors.append(0.1)
+            
+            ai_confidence = sum(confidence_factors) + 0.5  # Base confidence
+            
+            return {
+                'symbol': symbol,
+                'timestamp': datetime.now(),
+                'price_data': {
+                    'current_price': latest['close'],
+                    'change_24h': float(ticker_data.get('priceChangePercent', 0)),
+                    'volume_24h': float(ticker_data.get('volume', 0)),
+                    'high_24h': float(ticker_data.get('highPrice', 0)),
+                    'low_24h': float(ticker_data.get('lowPrice', 0))
+                },
+                'technical_indicators': {
+                    'rsi': latest['rsi'],
+                    'macd': latest['macd'],
+                    'macd_signal': latest['macd_signal'],
+                    'cmf': latest['cmf'],
+                    'adx': latest['adx'],
+                    'bb_position': (latest['close'] - latest['bb_lower']) / (latest['bb_upper'] - latest['bb_lower'])
+                },
+                'smc_analysis': smc_data,
+                'ict_analysis': ict_data,
+                'pivot_data': pivot_data,
+                'ai_analysis': {
+                    'sentiment': sentiment,
+                    'confidence': ai_confidence,
+                    'volatility': volatility,
+                    'momentum_20': momentum_20,
+                    'trend_strength': 'STRONG' if latest['adx'] > 25 else 'WEAK'
+                },
+                'signals': signals,
+                'funding_rate': float(funding_data.get('lastFundingRate', 0)) if isinstance(funding_data, dict) else 0
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in comprehensive analysis for {symbol}: {e}")
+            return None
+
+class AdvancedMarketAnalyzerBot:
+    """Main bot class with Telegram notifications"""
+    
+    def __init__(self, symbols: List[str] = None):
+        self.symbols = symbols or ['ASTERUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT']
+        self.analyzer = AdvancedAIMarketAnalyzer()
+        self.running = False
+        self.analysis_results = {}
+        self.last_notification_time = {}
+    
+    async def initialize(self):
+        """Initialize the bot"""
+        await self.analyzer.initialize()
+        logger.info("Advanced Market Analyzer Bot initialized successfully")
+        
+        # Send initialization message
+        await self.send_telegram_notification("🤖 Advanced Market Analyzer Bot Started!\n\nMonitoring symbols: " + ", ".join(self.symbols))
+    
+    async def cleanup(self):
+        """Cleanup resources"""
+        await self.analyzer.cleanup()
+        logger.info("Bot cleanup completed")
+    
+    async def send_telegram_notification(self, message: str):
+        """Send Telegram notification"""
+        try:
+            if self.analyzer.notifier:
+                await self.analyzer.notifier.send_message(message)
+        except Exception as e:
+            logger.error(f"Error sending Telegram notification: {e}")
+    
+    def format_analysis_message(self, analysis: Dict) -> str:
+        """Format analysis data for Telegram message"""
+        try:
+            symbol = analysis['symbol']
+            price_data = analysis['price_data']
+            ai_analysis = analysis['ai_analysis']
+            signals = analysis['signals']
+            
+            message = f"📊 <b>{symbol} Analysis Report</b>\n\n"
+            message += f"💰 Price: ${price_data['current_price']:.4f}\n"
+            message += f"📈 24h Change: {price_data['change_24h']:.2f}%\n"
+            message += f"🎯 Sentiment: <b>{ai_analysis['sentiment'].value}</b>\n"
+            message += f"💪 Trend: {ai_analysis['trend_strength']}\n"
+            message += f"📊 AI Confidence: {ai_analysis['confidence']:.2f}\n"
+            message += f"⚡ Volatility: {ai_analysis['volatility']:.2f}%\n"
+            message += f"🚀 Momentum (20h): {ai_analysis['momentum_20']:.2f}%\n\n"
+            
+            # Technical indicators
+            tech = analysis['technical_indicators']
+            message += f"📋 <b>Technical Indicators:</b>\n"
+            message += f"RSI: {tech['rsi']:.1f}\n"
+            message += f"CMF: {tech['cmf']:.3f}\n"
+            message += f"ADX: {tech['adx']:.1f}\n\n"
+            
+            # SMC Analysis
+            smc = analysis['smc_analysis']
+            if smc['order_blocks']:
+                message += f"🏦 <b>SMC Order Blocks:</b>\n"
+                for ob in smc['order_blocks'][:2]:
+                    message += f"• {ob['type'].replace('_', ' ').title()}: {ob['strength']:.3f}\n"
+                message += "\n"
+            
+            # Signals
+            if signals:
+                message += f"🔔 <b>Trading Signals ({len(signals)}):</b>\n"
+                for signal in signals[:3]:  # Limit to 3 signals
+                    message += f"• <b>{signal.signal_type.replace('_', ' ')}</b>\n"
+                    message += f"  Strength: {signal.strength:.2f} | Confidence: {signal.confidence:.2f}\n"
+                    if signal.target:
+                        message += f"  🎯 Target: ${signal.target:.4f}\n"
+                    if signal.stop_loss:
+                        message += f"  🛑 Stop Loss: ${signal.stop_loss:.4f}\n"
+                    message += f"  Method: {signal.method}\n\n"
+            
+            # Pivot Points
+            pivots = analysis['pivot_data']['pivot_points']
+            if pivots:
+                message += f"📍 <b>Pivot Points:</b>\n"
+                message += f"Pivot: ${pivots['pivot']:.4f}\n"
+                message += f"R1: ${pivots['r1']:.4f} | S1: ${pivots['s1']:.4f}\n\n"
+            
+            message += f"⏰ <i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>"
+            
+            return message
+            
+        except Exception as e:
+            logger.error(f"Error formatting analysis message: {e}")
+            return f"Error formatting analysis for {analysis.get('symbol', 'Unknown')}"
+    
+    def should_send_notification(self, symbol: str, signals: List[MarketSignal]) -> bool:
+        """Determine if notification should be sent"""
+        try:
+            # Send notification if there are high-confidence signals
+            high_confidence_signals = [s for s in signals if s.confidence > 0.7 and s.strength > 0.6]
+            
+            if not high_confidence_signals:
+                return False
+            
+            # Rate limiting: don't send notifications too frequently
+            last_time = self.last_notification_time.get(symbol, datetime.min)
+            if (datetime.now() - last_time).seconds < 1800:  # 30 minutes
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error checking notification criteria: {e}")
+            return False
+    
+    def display_analysis_console(self, analysis: Dict):
+        """Display analysis results in console"""
+        try:
+            symbol = analysis['symbol']
+            print(f"\n{'='*80}")
+            print(f"🚀 ADVANCED AI MARKET ANALYSIS: {symbol}")
+            print(f"{'='*80}")
+            
+            # Price information
+            price_data = analysis['price_data']
+            print(f"💰 Current Price: ${price_data['current_price']:.4f}")
+            print(f"📈 24h Change: {price_data['change_24h']:.2f}%")
+            print(f"📊 24h Volume: {price_data['volume_24h']:,.0f}")
+            
+            # AI Analysis
+            ai_analysis = analysis['ai_analysis']
+            print(f"\n🤖 AI ANALYSIS:")
+            print(f"   Sentiment: {ai_analysis['sentiment'].value}")
+            print(f"   Confidence: {ai_analysis['confidence']:.2f}")
+            print(f"   Volatility: {ai_analysis['volatility']:.2f}%")
+            print(f"   Momentum (20h): {ai_analysis['momentum_20']:.2f}%")
+            print(f"   Trend Strength: {ai_analysis['trend_strength']}")
+            
+            # Technical Indicators
+            tech = analysis['technical_indicators']
+            print(f"\n📊 TECHNICAL INDICATORS:")
+            print(f"   RSI: {tech['rsi']:.1f}")
+            print(f"   MACD: {tech['macd']:.4f}")
+            print(f"   CMF: {tech['cmf']:.3f}")
+            print(f"   ADX: {tech['adx']:.1f}")
+            print(f"   BB Position: {tech['bb_position']:.2f}")
+            
+            # SMC Analysis
+            smc = analysis['smc_analysis']
+            print(f"\n🏦 SMART MONEY CONCEPTS:")
+            print(f"   Market Structures: {len(smc['structures'])}")
+            print(f"   Order Blocks: {len(smc['order_blocks'])}")
+            print(f"   Fair Value Gaps: {len(smc['fair_value_gaps'])}")
+            
+            # ICT Analysis
+            ict = analysis['ict_analysis']
+            print(f"\n⚡ ICT CONCEPTS:")
+            print(f"   Break of Structure: {len(ict['bos_signals'])}")
+            print(f"   Change of Character: {len(ict['choch_signals'])}")
+            
+            # Pivot Points
+            pivots = analysis['pivot_data']['pivot_points']
+            if pivots:
+                print(f"\n📍 PIVOT POINTS:")
+                print(f"   Pivot: ${pivots['pivot']:.4f}")
+                print(f"   Resistance: R1=${pivots['r1']:.4f}, R2=${pivots['r2']:.4f}")
+                print(f"   Support: S1=${pivots['s1']:.4f}, S2=${pivots['s2']:.4f}")
+            
+            # Fibonacci Levels
+            fib_levels = analysis['pivot_data']['fibonacci']
+            if fib_levels:
+                print(f"\n🌀 FIBONACCI LEVELS:")
+                key_levels = [f for f in fib_levels if f.percentage in [38.2, 50.0, 61.8]]
+                for level in key_levels[:3]:
+                    print(f"   {level.percentage}% {level.level_type}: ${level.level:.4f}")
+            
+            # Trading Signals
+            signals = analysis['signals']
+            if signals:
+                print(f"\n🔔 TRADING SIGNALS ({len(signals)}):")
+                for i, signal in enumerate(signals, 1):
+                    print(f"   {i}. {signal.signal_type.replace('_', ' ')}")
+                    print(f"      Method: {signal.method}")
+                    print(f"      Strength: {signal.strength:.2f} | Confidence: {signal.confidence:.2f}")
+                    if signal.target and signal.stop_loss:
+                        print(f"      Target: ${signal.target:.4f} | Stop Loss: ${signal.stop_loss:.4f}")
+            else:
+                print(f"\n🔔 No active trading signals")
+            
+            # Funding Rate
+            funding = analysis.get('funding_rate', 0)
+            print(f"\n💸 Funding Rate: {funding*100:.4f}%")
+            
+            print(f"\n⏰ Analysis Time: {analysis['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"{'='*80}")
+            
+        except Exception as e:
+            logger.error(f"Error displaying console analysis: {e}")
+    
+    async def analyze_all_symbols(self):
+        """Analyze all symbols"""
+        try:
+            logger.info("Starting comprehensive market analysis...")
+            
+            for symbol in self.symbols:
+                try:
+                    analysis = await self.analyzer.comprehensive_symbol_analysis(symbol)
+                    
+                    if analysis:
+                        self.analysis_results[symbol] = analysis
+                        self.display_analysis_console(analysis)
+                        
+                        # Check for notification-worthy signals
+                        if self.should_send_notification(symbol, analysis['signals']):
+                            message = self.format_analysis_message(analysis)
+                            await self.send_telegram_notification(message)
+                            self.last_notification_time[symbol] = datetime.now()
+                    
+                    # Rate limiting
+                    await asyncio.sleep(2)
+                    
+                except Exception as e:
+                    logger.error(f"Error analyzing {symbol}: {e}")
+                    continue
+        
+        except Exception as e:
+            logger.error(f"Error in market analysis: {e}")
+    
+    def display_market_summary(self):
+        """Display market summary"""
+        if not self.analysis_results:
+            return
+        
+        print(f"\n{'='*80}")
+        print("📋 MARKET SUMMARY")
+        print(f"{'='*80}")
+        
+        total_symbols = len(self.analysis_results)
+        sentiment_counts = {'BULLISH': 0, 'BEARISH': 0, 'NEUTRAL': 0, 'VOLATILE': 0}
+        total_signals = 0
+        high_confidence_signals = 0
+        avg_confidence = 0
+        
+        for symbol, analysis in self.analysis_results.items():
+            sentiment = analysis['ai_analysis']['sentiment'].value
+            sentiment_counts[sentiment] += 1
+            
+            signals = analysis['signals']
+            total_signals += len(signals)
+            high_confidence_signals += len([s for s in signals if s.confidence > 0.7])
+            avg_confidence += analysis['ai_analysis']['confidence']
+        
+        avg_confidence /= total_symbols
+        
+        print(f"📊 Analyzed Symbols: {total_symbols}")
+        print(f"🎯 Market Sentiment Distribution:")
+        for sentiment, count in sentiment_counts.items():
+            percentage = (count / total_symbols) * 100
+            print(f"   {sentiment}: {count} ({percentage:.1f}%)")
+        
+        print(f"🔔 Total Signals: {total_signals}")
+        print(f"⭐ High Confidence Signals: {high_confidence_signals}")
+        print(f"🤖 Average AI Confidence: {avg_confidence:.2f}")
+        print(f"⏰ Last Update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*80}")
+    
+    async def run_continuous(self, interval_minutes: int = 60):
+        """Run continuous analysis"""
+        self.running = True
+        logger.info(f"Starting continuous analysis every {interval_minutes} minutes")
+        
+        try:
+            while self.running:
+                await self.analyze_all_symbols()
+                self.display_market_summary()
+                
+                # Send summary notification every 4 hours
+                current_time = datetime.now()
+                if current_time.hour % 4 == 0 and current_time.minute < 5:
+                    summary_message = f"📋 <b>Market Summary Update</b>\n\n"
+                    summary_message += f"Analyzed {len(self.analysis_results)} symbols\n"
+                    summary_message += f"Total active signals: {sum(len(a['signals']) for a in self.analysis_results.values())}\n"
+                    summary_message += f"Time: {current_time.strftime('%H:%M:%S')}"
+                    
+                    await self.send_telegram_notification(summary_message)
+                
+                # Wait for next analysis cycle
+                logger.info(f"Waiting {interval_minutes} minutes for next analysis cycle...")
+                await asyncio.sleep(interval_minutes * 60)
+                
+        except KeyboardInterrupt:
+            logger.info("Stopping continuous analysis...")
+            self.running = False
+        except Exception as e:
+            logger.error(f"Error in continuous analysis: {e}")
+            self.running = False
+    
+    def stop(self):
+        """Stop the bot"""
+        self.running = False
+
+async def main():
+    """Main function"""
+    
+    print("""
+    🚀 ADVANCED BINANCE FUTURES AI MARKET ANALYZER
+    =============================================
+    Features:
+    ✅ Smart Money Concepts (SMC)
+    ✅ Inner Circle Trader (ICT) Analysis
+    ✅ Chaikin Money Flow (CMF)
+    ✅ Pivot Points & Fibonacci
+    ✅ Advanced AI Sentiment Analysis
+    ✅ Telegram Notifications
+    ✅ No TA-Lib dependency
+    
+    Setup Telegram Notifications:
+    - Set TELEGRAM_BOT_TOKEN environment variable
+    - Set TELEGRAM_CHAT_ID environment variable
+    
+    Starting analysis...
+    """)
+    
+    # Symbols to analyze
+    symbols = [
+        'ASTERUSDT', 'INUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT',
+        'XRPUSDT', 'DOTUSDT', 'LINKUSDT', 'AVAXUSDT', 'MATICUSDT'
+    ]
+    
+    # Initialize bot
+    bot = AdvancedMarketAnalyzerBot(symbols)
+    
+    try:
+        await bot.initialize()
+        
+        # Run single analysis first
+        print("🔍 Running initial market analysis...")
+        await bot.analyze_all_symbols()
+        bot.display_market_summary()
+        
+        # Ask for continuous mode
+        print("\n💡 Single analysis completed.")
+        print("🔄 For continuous monitoring, modify the script to call:")
+        print("await bot.run_continuous(interval_minutes=60)")
+        
+        # Demo: Run a few more cycles
+        print("\n🔄 Running 2 more analysis cycles for demo...")
+        for i in range(2):
+            print(f"\n--- Analysis Cycle {i+2}/3 ---")
+            await asyncio.sleep(30)  # Wait 30 seconds
+            await bot.analyze_all_symbols()
+            bot.display_market_summary()
+        
     except Exception as e:
-        print(f"Telegram send error: {e}")
-        # Fallback to plain text
-        try:
-            import re
-            plain_msg = re.sub(r'<[^>]+>', '', msg)
-            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": plain_msg})
-        except:
-            print("All Telegram send methods failed")
+        logger.error(f"Error running bot: {e}")
+    finally:
+        await bot.cleanup()
 
-def telegram_listener():
-    offset = 0
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    while True:
-        try:
-            resp = requests.get(url, params={"timeout":30, "offset":offset}).json()
-            for upd in resp.get("result", []):
-                offset = upd["update_id"]+1
-                if "message" in upd:
-                    text = upd["message"].get("text", "")
-                    if text == "/refresh":
-                        run_analysis(send_to_tg=True)
-                    elif text == "/status":
-                        status_msg = f"""
-🤖 <b>Bot Status Report</b>
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ Status: <code>ACTIVE</code>
-⏰ Refresh Interval: <code>{REFRESH_INTERVAL//60} minutes</code>
-🕒 Last Update: <code>{datetime.now().strftime('%H:%M:%S')}</code>
-📊 Exchange: <code>Binance Futures</code>
-🔄 Auto-Analysis: <code>ENABLED</code>
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Commands:
-• /refresh - Manual analysis
-• /status - This status
-• /test - Test message format
-"""
-                        send_telegram(status_msg)
-                    elif text == "/test":
-                        test_msg = f"""
-🧪 <b>Test Message Format</b>
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ <b>Bold text works</b>
-✅ <i>Italic text works</i>  
-✅ <code>Monospace works</code>
-✅ Emojis work: 📊🚀📈📉🔥⚡
-✅ Special chars: ├─└━
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-If this displays correctly, HTML formatting is working!
-"""
-                        send_telegram(test_msg)
-        except Exception as e:
-            print("TG Listener Error:", e)
-        time.sleep(2)
-
-# -----------------------------
-# Runner
-# -----------------------------
-def run_analysis(send_to_tg=False):
-    st.title("📊 RUAS Pro Multi-Pair Analysis Dashboard")
-    pairs = get_top_volatile_pairs()
+if __name__ == "__main__":
+    print("📦 Required packages: aiohttp pandas numpy asyncio logging")
+    print("🔑 Set environment variables: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
+    print("🚀 Starting Advanced Market Analyzer Bot...\n")
     
-    # Send summary header
-    if send_to_tg:
-        header = f"""
-🤖 <b>AUTOMATED ANALYSIS REPORT</b>
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-📊 <b>Pairs Analyzed:</b> {len(pairs)}
-🔄 <b>Timeframe:</b> 10m
-⚡ <b>Mode:</b> Auto-Scan
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-        send_telegram(header)
-    
-    successful_analyses = 0
-    for sym in pairs:
-        try:
-            df, notification, signal_data, pivot_levels, fibs = generate_analysis(sym, "5m")
-            
-            # Streamlit display
-            st.subheader(f"{sym} - {signal_data['recommendation']}")
-            fig = plot_chart(df, 
-                           pivot_levels['r1'], pivot_levels['s1'], 
-                           fibs, pivot_levels['pivot'], 
-                           pivot_levels['r1'], pivot_levels['s1'])
-            st.plotly_chart(fig, use_container_width=True)
-            st.text(notification)
-            
-            # Send to Telegram only for strong signals or BUY/SELL
-            if send_to_tg and signal_data['recommendation'] in ['STRONG BUY', 'STRONG SELL', 'BUY', 'SELL']:
-                send_telegram(notification)
-                successful_analyses += 1
-                time.sleep(300)  # Avoid rate limiting
-                
-        except Exception as e:
-            error_msg = f"❌ <b>Error analyzing {sym}:</b> {str(e)}"
-            st.error(error_msg)
-            print(f"Error analyzing {sym}: {e}")
-    
-    # Send summary footer
-    if send_to_tg:
-        footer = f"""
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 <b>ANALYSIS COMPLETE</b>
-✅ <b>Signals Sent:</b> {successful_analyses}
-⏰ <b>Next Scan:</b> {REFRESH_INTERVAL//180} minutes
-🤖 <b>Bot Version:</b> v2.0 RUAS Pro
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-        send_telegram(footer)
-
-# -----------------------------
-# Main
-# -----------------------------
-if __name__=="__main__":
-    threading.Thread(target=telegram_listener, daemon=True).start()
-    while True:
-        run_analysis(send_to_tg=True)
-        time.sleep(REFRESH_INTERVAL)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Bot stopped by user")
+    except Exception as e:
+        print(f"❌ Bot error: {e}")
