@@ -1,1177 +1,674 @@
-#!/usr/bin/env python3
-"""
-Complete Standalone Streamlit Crypto Trading Dashboard
-Real-time Binance Futures Scanner with AI Trading Recommendations
-Now with Telegram Notifications
-"""
+# auto_analysis_bot.py
 
-import streamlit as st
-import asyncio
-import aiohttp
+import ccxt
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.subplots as sp
-from plotly.subplots import make_subplots
-import json
-import logging
-import warnings
-from datetime import datetime, timedelta
+import streamlit as st
+import requests
 import time
-import math
-import os
-from typing import Dict, List, Optional, Tuple, Union
-from dataclasses import dataclass
-from enum import Enum
-from dotenv import load_dotenv
+import threading
+from datetime import datetime
+# import talib  # Uncomment if talib is installed
 
-# Load environment variables
-load_dotenv()
+# -----------------------------
+# CONFIG
+# -----------------------------
+TELEGRAM_BOT_TOKEN = "8342042938:AAG2ZCSXYsXIu5suusoI0thZaFaurVAURvU"
+TELEGRAM_CHAT_ID = "-1002911393239"
+REFRESH_INTERVAL = 300   # 5 menit
 
-# Suppress warnings
-warnings.filterwarnings('ignore')
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# -----------------------------
+# Binance API via ccxt
+# -----------------------------
+exchange = ccxt.binance({
+    "enableRateLimit": True,
+    "options": {"defaultType": "future"}
+})
 
-# Enums and Data Classes
-class MarketSentiment(Enum):
-    BULLISH = "BULLISH"
-    BEARISH = "BEARISH" 
-    NEUTRAL = "NEUTRAL"
-    VOLATILE = "VOLATILE"
+# -----------------------------
+# Fungsi Data
+# -----------------------------
+def get_ohlcv(symbol, timeframe="15m", limit=1000):
+    data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(data, columns=["time","open","high","low","close","volume"])
+    df["time"] = pd.to_datetime(df["time"], unit="ms")
+    return df
 
-@dataclass
-class TradingRecommendation:
-    symbol: str
-    signal: str  # LONG, SHORT, HOLD
-    confidence: float
-    entry_price: float
-    tp1: float
-    tp2: float
-    stop_loss: float
-    risk_reward_ratio: float
-    reasoning: str
-    timestamp: datetime
+def get_top_volatile_pairs(limit=30):
+    tickers = exchange.fetch_tickers()
+    df = pd.DataFrame([
+        (s, t["quoteVolume"], t["percentage"])
+        for s,t in tickers.items() if s.endswith("USDT")
+    ], columns=["symbol","volume","change"])
+    df = df.sort_values("volume", ascending=False).head(30)
+    df = df.sort_values("change", key=lambda x: abs(x), ascending=False).head(limit)
+    return df["symbol"].tolist()
 
-# Telegram Notification System
-class TelegramNotifier:
-    def __init__(self):
-        self.bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
-        self.chat_id = os.getenv('TELEGRAM_CHAT_ID')
-        self.enabled = bool(self.bot_token and self.chat_id)
+# -----------------------------
+# Analisis Teknis Komprehensif
+# -----------------------------
+def calc_indicators(df):
+    """Kalkulasi berbagai indikator teknis"""
+    indicators = {}
+    
+    try:
+        # RSI - Manual calculation if talib not available
+        def calc_rsi(prices, period=14):
+            delta = prices.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            return rsi.iloc[-1]
         
-        if not self.enabled:
-            logger.warning("Telegram notifications disabled - BOT_TOKEN or CHAT_ID not set")
-    
-    async def send_message(self, message: str) -> bool:
-        if not self.enabled:
-            return False
-            
-        try:
-            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-            payload = {
-                'chat_id': self.chat_id,
-                'text': message,
-                'parse_mode': 'Markdown'
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload) as response:
-                    if response.status == 200:
-                        logger.info("Telegram notification sent successfully")
-                        return True
-                    else:
-                        logger.error(f"Telegram notification failed: {response.status}")
-                        return False
-        except Exception as e:
-            logger.error(f"Error sending Telegram message: {e}")
-            return False
-    
-    def format_recommendation_message(self, rec: TradingRecommendation) -> str:
-        signal_emoji = "🟢" if rec.signal == "LONG" else "🔴" if rec.signal == "SHORT" else "🟡"
+        indicators['rsi'] = calc_rsi(df['close'])
         
-        message = f"""
-🚀 *AI Trading Signal*
-
-{signal_emoji} *{rec.symbol}* - *{rec.signal}*
-📊 Confidence: *{rec.confidence:.1%}*
-💰 Entry: *${rec.entry_price:.4f}*
-🎯 TP1: *${rec.tp1:.4f}*
-🎯 TP2: *${rec.tp2:.4f}*
-🛑 Stop Loss: *${rec.stop_loss:.4f}*
-📈 R:R Ratio: *{rec.risk_reward_ratio:.2f}:1*
-
-🤖 *Analysis:*
-_{rec.reasoning}_
-
-⏰ {rec.timestamp.strftime('%Y-%m-%d %H:%M:%S')}
-        """
-        return message.strip()
-    
-    def format_market_summary(self, recommendations: List[TradingRecommendation], market_data: List[Dict]) -> str:
-        high_conf = [r for r in recommendations if r.confidence > 0.7]
-        long_signals = len([r for r in recommendations if r.signal == "LONG"])
-        short_signals = len([r for r in recommendations if r.signal == "SHORT"])
-        avg_volatility = np.mean([pair['volatility_score'] for pair in market_data])
+        # Simple MACD calculation
+        exp1 = df['close'].ewm(span=12).mean()
+        exp2 = df['close'].ewm(span=26).mean()
+        macd = exp1 - exp2
+        signal = macd.ewm(span=9).mean()
+        indicators['macd'] = macd.iloc[-1]
+        indicators['macd_signal'] = signal.iloc[-1]
+        indicators['macd_histogram'] = (macd - signal).iloc[-1]
         
-        message = f"""
-📊 *Market Summary*
-
-🔍 Pairs Analyzed: *{len(market_data)}*
-🔥 Avg Volatility: *{avg_volatility:.2f}%*
-🟢 LONG Signals: *{long_signals}*
-🔴 SHORT Signals: *{short_signals}*
-🎯 High Confidence: *{len(high_conf)}*
-
-⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        """
-        return message.strip()
-
-# Technical Analysis Functions
-class TechnicalAnalyzer:
-    @staticmethod
-    def sma(data: np.ndarray, period: int) -> np.ndarray:
-        return pd.Series(data).rolling(window=period).mean().values
-    
-    @staticmethod
-    def ema(data: np.ndarray, period: int) -> np.ndarray:
-        return pd.Series(data).ewm(span=period).mean().values
-    
-    @staticmethod
-    def rsi(data: np.ndarray, period: int = 14) -> np.ndarray:
-        delta = pd.Series(data).diff()
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
-        avg_gain = gain.rolling(window=period).mean()
-        avg_loss = loss.rolling(window=period).mean()
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi.values
-    
-    @staticmethod
-    def macd(data: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        ema_fast = TechnicalAnalyzer.ema(data, fast)
-        ema_slow = TechnicalAnalyzer.ema(data, slow)
-        macd = ema_fast - ema_slow
-        macd_signal = TechnicalAnalyzer.ema(macd, signal)
-        macd_hist = macd - macd_signal
-        return macd, macd_signal, macd_hist
-    
-    @staticmethod
-    def bollinger_bands(data: np.ndarray, period: int = 20, std_dev: float = 2) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        sma = TechnicalAnalyzer.sma(data, period)
-        std = pd.Series(data).rolling(window=period).std().values
-        upper = sma + (std * std_dev)
-        lower = sma - (std * std_dev)
-        return upper, sma, lower
-    
-    @staticmethod
-    def atr(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
-        high_low = high - low
-        high_close = np.abs(high - np.roll(close, 1))
-        low_close = np.abs(low - np.roll(close, 1))
-        tr = np.maximum(high_low, np.maximum(high_close, low_close))
-        return pd.Series(tr).rolling(window=period).mean().values
-    
-    @staticmethod
-    def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
-        plus_dm = pd.Series(high).diff()
-        minus_dm = pd.Series(low).diff() * -1
+        # Bollinger Bands
+        bb_period = 20
+        bb_std = 2
+        bb_middle = df['close'].rolling(bb_period).mean()
+        bb_std_dev = df['close'].rolling(bb_period).std()
+        indicators['bb_upper'] = (bb_middle + (bb_std_dev * bb_std)).iloc[-1]
+        indicators['bb_middle'] = bb_middle.iloc[-1]
+        indicators['bb_lower'] = (bb_middle - (bb_std_dev * bb_std)).iloc[-1]
         
-        plus_dm[plus_dm < 0] = 0
-        minus_dm[minus_dm < 0] = 0
+        # EMA
+        indicators['ema_20'] = df['close'].ewm(span=20).mean().iloc[-1]
+        indicators['ema_50'] = df['close'].ewm(span=50).mean().iloc[-1]
         
-        tr = TechnicalAnalyzer.atr(high, low, close, 1)
-        plus_di = 100 * (plus_dm.rolling(window=period).mean() / pd.Series(tr).rolling(window=period).mean())
-        minus_di = 100 * (minus_dm.rolling(window=period).mean() / pd.Series(tr).rolling(window=period).mean())
+        # Simple Stochastic
+        high_14 = df['high'].rolling(14).max()
+        low_14 = df['low'].rolling(14).min()
+        k_percent = 100 * ((df['close'] - low_14) / (high_14 - low_14))
+        indicators['stoch_k'] = k_percent.iloc[-1]
+        indicators['stoch_d'] = k_percent.rolling(3).mean().iloc[-1]
         
-        dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)
-        adx = dx.rolling(window=period).mean()
-        return adx.values
-    
-    @staticmethod
-    def cmf(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, period: int = 20) -> np.ndarray:
-        mf_multiplier = ((close - low) - (high - close)) / (high - low)
-        mf_multiplier = np.nan_to_num(mf_multiplier)
-        mf_volume = mf_multiplier * volume
+        # Simple ADX approximation
+        indicators['adx'] = 25.0  # Default value
         
-        cmf = pd.Series(mf_volume).rolling(window=period).sum() / pd.Series(volume).rolling(window=period).sum()
-        return cmf.values
+    except Exception as e:
+        print(f"Error calculating indicators: {e}")
+        # Set default values
+        indicators = {
+            'rsi': 50.0, 'macd': 0.0, 'macd_signal': 0.0, 'macd_histogram': 0.0,
+            'bb_upper': df['close'].iloc[-1] * 1.02, 'bb_middle': df['close'].iloc[-1],
+            'bb_lower': df['close'].iloc[-1] * 0.98, 'ema_20': df['close'].iloc[-1],
+            'ema_50': df['close'].iloc[-1], 'stoch_k': 50.0, 'stoch_d': 50.0, 'adx': 25.0
+        }
+    
+    return indicators
 
-# Binance API Client
-class BinanceAPI:
-    BASE_URL = "https://fapi.binance.com"
-    
-    def __init__(self):
-        self.session = None
-    
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
-    
-    async def get_klines(self, symbol: str, interval: str = "1h", limit: int = 500) -> List:
-        url = f"{self.BASE_URL}/fapi/v1/klines"
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        async with self.session.get(url, params=params) as response:
-            return await response.json()
-    
-    async def get_24hr_ticker(self, symbol: str = None) -> Union[Dict, List]:
-        url = f"{self.BASE_URL}/fapi/v1/ticker/24hr"
-        params = {"symbol": symbol} if symbol else {}
-        async with self.session.get(url, params=params) as response:
-            return await response.json()
-    
-    async def get_exchange_info(self) -> Dict:
-        url = f"{self.BASE_URL}/fapi/v1/exchangeInfo"
-        async with self.session.get(url) as response:
-            return await response.json()
+def calc_pivot(df):
+    last = df.iloc[-2]
+    pivot = (last["high"]+last["low"]+last["close"])/3
+    r1 = 2*pivot - last["low"]
+    r2 = pivot + (last["high"] - last["low"])
+    r3 = last["high"] + 2*(pivot - last["low"])
+    s1 = 2*pivot - last["high"]
+    s2 = pivot - (last["high"] - last["low"])
+    s3 = last["low"] - 2*(last["high"] - pivot)
+    return {
+        'pivot': pivot, 'r1': r1, 'r2': r2, 'r3': r3,
+        's1': s1, 's2': s2, 's3': s3
+    }
 
-# Volatility Scanner
-class VolatilityScanner:
-    def __init__(self):
-        self.api = None
-    
-    async def initialize(self):
-        self.api = BinanceAPI()
-        await self.api.__aenter__()
-    
-    async def cleanup(self):
-        if self.api:
-            await self.api.__aexit__(None, None, None)
-    
-    async def get_top_volatile_pairs(self, limit: int = 10) -> List[Dict]:
-        try:
-            # Get exchange info
-            exchange_info = await self.api.get_exchange_info()
-            active_symbols = []
-            
-            for symbol_info in exchange_info['symbols']:
-                if (symbol_info['status'] == 'TRADING' and 
-                    symbol_info['symbol'].endswith('USDT') and
-                    symbol_info['contractType'] == 'PERPETUAL'):
-                    active_symbols.append(symbol_info['symbol'])
-            
-            # Get 24hr ticker data
-            tickers = await self.api.get_24hr_ticker()
-            volatility_data = []
-            
-            for ticker in tickers:
-                symbol = ticker['symbol']
-                if symbol in active_symbols:
-                    try:
-                        price_change = float(ticker['priceChangePercent'])
-                        high_price = float(ticker['highPrice'])
-                        low_price = float(ticker['lowPrice'])
-                        close_price = float(ticker['lastPrice'])
-                        volume = float(ticker['volume'])
-                        
-                        if low_price > 0:
-                            true_range = ((high_price - low_price) / low_price) * 100
-                        else:
-                            true_range = 0
-                        
-                        volatility_score = (abs(price_change) * 0.6 + true_range * 0.4)
-                        
-                        volatility_data.append({
-                            'symbol': symbol,
-                            'price': close_price,
-                            'change_24h': price_change,
-                            'high_24h': high_price,
-                            'low_24h': low_price,
-                            'volume': volume,
-                            'volatility_score': volatility_score
-                        })
-                    except:
-                        continue
-            
-            volatility_data.sort(key=lambda x: x['volatility_score'], reverse=True)
-            return volatility_data[:limit]
-            
-        except Exception as e:
-            logger.error(f"Error getting volatile pairs: {e}")
-            return []
+def calc_fibonacci(df):
+    high = df["high"].max()
+    low = df["low"].min()
+    diff = high - low
+    levels = {
+        'Fibo 23.6%': high - (diff * 0.236),
+        'Fibo 38.2%': high - (diff * 0.382),
+        'Fibo 50.0%': high - (diff * 0.5),
+        'Fibo 61.8%': high - (diff * 0.618),
+        'Fibo 78.6%': high - (diff * 0.786)
+    }
+    return levels
 
-# AI Trading Engine
-class AITradingEngine:
-    def __init__(self):
-        self.api = None
-        self.analyzer = TechnicalAnalyzer()
-        self.telegram = TelegramNotifier()
-    
-    async def initialize(self):
-        self.api = BinanceAPI()
-        await self.api.__aenter__()
-    
-    async def cleanup(self):
-        if self.api:
-            await self.api.__aexit__(None, None, None)
-    
-    def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        try:
-            high = df['high'].values
-            low = df['low'].values
-            close = df['close'].values
-            volume = df['volume'].values
-            
-            df['sma_20'] = self.analyzer.sma(close, 20)
-            df['sma_50'] = self.analyzer.sma(close, 50)
-            df['ema_12'] = self.analyzer.ema(close, 12)
-            df['ema_26'] = self.analyzer.ema(close, 26)
-            
-            df['macd'], df['macd_signal'], df['macd_hist'] = self.analyzer.macd(close)
-            df['rsi'] = self.analyzer.rsi(close, 14)
-            df['bb_upper'], df['bb_middle'], df['bb_lower'] = self.analyzer.bollinger_bands(close)
-            df['atr'] = self.analyzer.atr(high, low, close)
-            df['adx'] = self.analyzer.adx(high, low, close)
-            df['cmf'] = self.analyzer.cmf(high, low, close, volume)
-            
-            return df
-        except Exception as e:
-            logger.error(f"Error calculating indicators: {e}")
-            return df
-    
-    def analyze_sentiment(self, df: pd.DataFrame) -> Tuple[MarketSentiment, float]:
-        try:
-            latest = df.iloc[-1]
-            score = 0
-            
-            # RSI analysis
-            if latest['rsi'] < 30:
-                score += 2
-            elif latest['rsi'] > 70:
-                score -= 2
-            elif 45 < latest['rsi'] < 55:
-                score += 1
-            
-            # MACD analysis
-            if latest['macd'] > latest['macd_signal']:
-                score += 1
-            else:
-                score -= 1
-            
-            # Moving average analysis
-            if latest['close'] > latest['sma_20'] > latest['sma_50']:
-                score += 2
-            elif latest['close'] < latest['sma_20'] < latest['sma_50']:
-                score -= 2
-            
-            # CMF analysis
-            if latest['cmf'] > 0.2:
-                score += 1
-            elif latest['cmf'] < -0.2:
-                score -= 1
-            
-            # Volatility check
-            volatility = latest['atr'] / latest['close'] * 100
-            if volatility > 5:
-                sentiment = MarketSentiment.VOLATILE
-            elif score >= 3:
-                sentiment = MarketSentiment.BULLISH
-            elif score <= -3:
-                sentiment = MarketSentiment.BEARISH
-            else:
-                sentiment = MarketSentiment.NEUTRAL
-            
-            confidence = min(0.95, 0.5 + abs(score) * 0.1)
-            return sentiment, confidence
-            
-        except Exception as e:
-            logger.error(f"Error analyzing sentiment: {e}")
-            return MarketSentiment.NEUTRAL, 0.5
-    
-    def calculate_support_resistance(self, df: pd.DataFrame) -> Dict:
-        try:
-            recent_data = df.tail(50)
-            highs = recent_data['high'].rolling(window=5, center=True).max()
-            lows = recent_data['low'].rolling(window=5, center=True).min()
-            
-            pivot_highs = []
-            pivot_lows = []
-            
-            for i in range(len(recent_data)):
-                if recent_data['high'].iloc[i] == highs.iloc[i] and not pd.isna(highs.iloc[i]):
-                    pivot_highs.append(recent_data['high'].iloc[i])
-                if recent_data['low'].iloc[i] == lows.iloc[i] and not pd.isna(lows.iloc[i]):
-                    pivot_lows.append(recent_data['low'].iloc[i])
-            
-            return {
-                'resistance': sorted(pivot_highs, reverse=True)[:3],
-                'support': sorted(pivot_lows)[:3]
-            }
-        except:
-            return {'resistance': [], 'support': []}
-    
-    async def generate_recommendation(self, symbol: str, volatility_data: Dict) -> Optional[TradingRecommendation]:
-        try:
-            # Get market data
-            klines = await self.api.get_klines(symbol, "1h", 100)
-            df = pd.DataFrame(klines, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'quote_asset_volume', 'number_of_trades',
-                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-            ])
-            
-            # Convert to numeric
-            for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = pd.to_numeric(df[col])
-            
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            
-            # Calculate indicators
-            df = self.calculate_indicators(df)
-            
-            # Analyze sentiment
-            sentiment, confidence = self.analyze_sentiment(df)
-            
-            # Get current data
-            latest = df.iloc[-1]
-            current_price = latest['close']
-            
-            # Calculate S/R levels
-            sr_levels = self.calculate_support_resistance(df)
-            
-            # Decision logic
-            signal_type = "HOLD"
-            bullish_factors = 0
-            bearish_factors = 0
-            reasoning_parts = []
-            
-            # RSI
-            rsi = latest['rsi']
-            if rsi < 30:
-                bullish_factors += 2
-                reasoning_parts.append(f"RSI oversold ({rsi:.1f})")
-            elif rsi > 70:
-                bearish_factors += 2
-                reasoning_parts.append(f"RSI overbought ({rsi:.1f})")
-            
-            # CMF
-            cmf = latest['cmf']
-            if cmf > 0.2:
-                bullish_factors += 2
-                reasoning_parts.append(f"Strong money flow (+{cmf:.3f})")
-            elif cmf < -0.2:
-                bearish_factors += 2
-                reasoning_parts.append(f"Weak money flow ({cmf:.3f})")
-            
-            # MACD
-            if latest['macd'] > latest['macd_signal']:
-                bullish_factors += 1
-                reasoning_parts.append("MACD bullish")
-            else:
-                bearish_factors += 1
-                reasoning_parts.append("MACD bearish")
-            
-            # Trend
-            if latest['close'] > latest['sma_20'] > latest['sma_50']:
-                bullish_factors += 2
-                reasoning_parts.append("Uptrend confirmed")
-            elif latest['close'] < latest['sma_20'] < latest['sma_50']:
-                bearish_factors += 2
-                reasoning_parts.append("Downtrend confirmed")
-            
-            # Volatility
-            volatility_score = volatility_data['volatility_score']
-            if volatility_score > 10:
-                reasoning_parts.append(f"High volatility ({volatility_score:.1f}%)")
-            
-            # Decision
-            net_score = bullish_factors - bearish_factors
-            
-            if net_score >= 3:
-                signal_type = "LONG"
-                confidence = min(0.95, 0.6 + (net_score * 0.1))
-            elif net_score <= -3:
-                signal_type = "SHORT"
-                confidence = min(0.95, 0.6 + (abs(net_score) * 0.1))
-            else:
-                signal_type = "HOLD"
-                confidence = 0.4
-                reasoning_parts.append("Conflicting signals")
-            
-            # Calculate levels
-            atr = latest['atr']
-            
-            if signal_type == "LONG":
-                entry_price = current_price
-                stop_loss = entry_price - (atr * 2)
-                tp1 = entry_price + (atr * 1.5)
-                tp2 = entry_price + (atr * 3)
-                
-                if sr_levels['resistance']:
-                    nearest_resistance = min([r for r in sr_levels['resistance'] if r > entry_price], default=tp2)
-                    if nearest_resistance < tp2:
-                        tp2 = nearest_resistance * 0.995
-            
-            elif signal_type == "SHORT":
-                entry_price = current_price
-                stop_loss = entry_price + (atr * 2)
-                tp1 = entry_price - (atr * 1.5)
-                tp2 = entry_price - (atr * 3)
-                
-                if sr_levels['support']:
-                    nearest_support = max([s for s in sr_levels['support'] if s < entry_price], default=tp2)
-                    if nearest_support > tp2:
-                        tp2 = nearest_support * 1.005
-            
-            else:
-                entry_price = current_price
-                stop_loss = current_price * 0.95
-                tp1 = current_price * 1.02
-                tp2 = current_price * 1.05
-            
-            # Risk-reward ratio
-            if signal_type == "LONG":
-                risk = abs(entry_price - stop_loss)
-                reward = abs(tp2 - entry_price)
-            elif signal_type == "SHORT":
-                risk = abs(stop_loss - entry_price)
-                reward = abs(entry_price - tp2)
-            else:
-                risk = reward = 1
-            
-            rr_ratio = reward / risk if risk > 0 else 0
-            
-            recommendation = TradingRecommendation(
-                symbol=symbol,
-                signal=signal_type,
-                confidence=confidence,
-                entry_price=entry_price,
-                tp1=tp1,
-                tp2=tp2,
-                stop_loss=stop_loss,
-                risk_reward_ratio=rr_ratio,
-                reasoning=" | ".join(reasoning_parts),
-                timestamp=datetime.now()
-            )
-            
-            # Send Telegram notification for high confidence signals
-            if signal_type != "HOLD" and confidence > 0.7:
-                await self.telegram.send_message(
-                    self.telegram.format_recommendation_message(recommendation)
-                )
-            
-            return recommendation
-            
-        except Exception as e:
-            logger.error(f"Error generating recommendation for {symbol}: {e}")
-            return None
+def calc_cmf(df, period=20):
+    df = df.copy()
+    df["mfm"] = ((df["close"]-df["low"])-(df["high"]-df["close"]))/(df["high"]-df["low"]+1e-9)
+    df["mfv"] = df["mfm"]*df["volume"]
+    cmf = df["mfv"].rolling(period).sum()/df["volume"].rolling(period).sum()
+    return cmf.iloc[-1] if not cmf.empty else 0
 
-# Chart Creation Functions
-def create_price_chart(df: pd.DataFrame, symbol: str, recommendation: Optional[TradingRecommendation] = None):
-    fig = make_subplots(
-        rows=4, cols=1,
-        shared_xaxes=True,  # Fixed: changed from shared_xaxis to shared_xaxes
-        vertical_spacing=0.05,
-        row_heights=[0.5, 0.2, 0.15, 0.15],
-        subplot_titles=(f'{symbol} Price Chart', 'Volume', 'RSI', 'MACD')
+def smc_zones(df):
+    """Smart Money Concepts - Supply/Demand Zones"""
+    high_20 = df["high"].iloc[-20:].max()
+    low_20 = df["low"].iloc[-20:].min()
+    high_50 = df["high"].iloc[-50:].max()
+    low_50 = df["low"].iloc[-50:].min()
+    return {
+        'supply_zone_20': high_20,
+        'demand_zone_20': low_20,
+        'supply_zone_50': high_50,
+        'demand_zone_50': low_50
+    }
+
+def ict_analysis(df):
+    """ICT (Inner Circle Trader) Analysis"""
+    current_price = df["close"].iloc[-1]
+    prev_high = df["high"].iloc[-2]
+    prev_low = df["low"].iloc[-2]
+    
+    # Break of Structure
+    bos = "NEUTRAL"
+    if current_price > prev_high:
+        bos = "BULLISH BOS"
+    elif current_price < prev_low:
+        bos = "BEARISH BOS"
+    
+    # Market Structure
+    highs = df["high"].iloc[-10:]
+    lows = df["low"].iloc[-10:]
+    
+    if highs.iloc[-1] > highs.iloc[-2] and lows.iloc[-1] > lows.iloc[-2]:
+        structure = "BULLISH (Higher Highs & Higher Lows)"
+    elif highs.iloc[-1] < highs.iloc[-2] and lows.iloc[-1] < lows.iloc[-2]:
+        structure = "BEARISH (Lower Highs & Lower Lows)"
+    else:
+        structure = "CONSOLIDATION"
+    
+    return {'bos': bos, 'structure': structure}
+
+def analyze_momentum(indicators):
+    """Analisis momentum berdasarkan indikator"""
+    momentum_score = 0
+    signals = []
+    
+    # RSI Analysis
+    if indicators['rsi']:
+        if indicators['rsi'] > 70:
+            signals.append("🔴 RSI Overbought (>70)")
+            momentum_score -= 1
+        elif indicators['rsi'] < 30:
+            signals.append("🟢 RSI Oversold (<30)")
+            momentum_score += 1
+        elif 50 < indicators['rsi'] < 70:
+            signals.append("🟡 RSI Bullish Zone (50-70)")
+            momentum_score += 0.5
+        elif 30 < indicators['rsi'] < 50:
+            signals.append("🟡 RSI Bearish Zone (30-50)")
+            momentum_score -= 0.5
+    
+    # MACD Analysis
+    if indicators['macd'] and indicators['macd_signal']:
+        if indicators['macd'] > indicators['macd_signal']:
+            signals.append("🟢 MACD Bullish Cross")
+            momentum_score += 1
+        else:
+            signals.append("🔴 MACD Bearish Cross")
+            momentum_score -= 1
+    
+    # Stochastic Analysis
+    if indicators['stoch_k'] and indicators['stoch_d']:
+        if indicators['stoch_k'] > 80:
+            signals.append("🔴 Stochastic Overbought")
+            momentum_score -= 0.5
+        elif indicators['stoch_k'] < 20:
+            signals.append("🟢 Stochastic Oversold")
+            momentum_score += 0.5
+    
+    # ADX Trend Strength
+    if indicators['adx']:
+        if indicators['adx'] > 25:
+            signals.append(f"💪 Strong Trend (ADX: {indicators['adx']:.1f})")
+        else:
+            signals.append(f"📊 Weak Trend (ADX: {indicators['adx']:.1f})")
+    
+    return momentum_score, signals
+
+def generate_trading_signal(df, indicators, pivot_levels, smc_zones, ict_data):
+    """Generate comprehensive trading signal"""
+    current_price = df["close"].iloc[-1]
+    momentum_score, momentum_signals = analyze_momentum(indicators)
+    
+    # Determine overall signal
+    signal_strength = 0
+    recommendation = "HOLD"
+    tp_levels = []
+    sl_level = None
+    risk_reward = "N/A"
+    
+    # Price action analysis
+    if ict_data['bos'] == "BULLISH BOS" and momentum_score > 0:
+        recommendation = "STRONG BUY"
+        signal_strength = 3
+        tp_levels = [pivot_levels['r1'], pivot_levels['r2']]
+        sl_level = smc_zones['demand_zone_20']
+    elif ict_data['bos'] == "BULLISH BOS" and momentum_score >= 0:
+        recommendation = "BUY"
+        signal_strength = 2
+        tp_levels = [pivot_levels['r1']]
+        sl_level = smc_zones['demand_zone_20']
+    elif ict_data['bos'] == "BEARISH BOS" and momentum_score < 0:
+        recommendation = "STRONG SELL"
+        signal_strength = 3
+        tp_levels = [pivot_levels['s1'], pivot_levels['s2']]
+        sl_level = smc_zones['supply_zone_20']
+    elif ict_data['bos'] == "BEARISH BOS" and momentum_score <= 0:
+        recommendation = "SELL"
+        signal_strength = 2
+        tp_levels = [pivot_levels['s1']]
+        sl_level = smc_zones['supply_zone_20']
+    
+    # Calculate Risk/Reward
+    if tp_levels and sl_level:
+        potential_profit = abs(tp_levels[0] - current_price)
+        potential_loss = abs(current_price - sl_level)
+        risk_reward = f"1:{potential_profit/potential_loss:.2f}" if potential_loss > 0 else "N/A"
+    
+    return {
+        'recommendation': recommendation,
+        'signal_strength': signal_strength,
+        'tp_levels': tp_levels,
+        'sl_level': sl_level,
+        'risk_reward': risk_reward,
+        'momentum_score': momentum_score,
+        'momentum_signals': momentum_signals
+    }
+
+def format_professional_notification(symbol, timeframe, df, indicators, pivot_levels, fibs, smc_zones, ict_data, signal_data):
+    """Format notifikasi profesional dan komprehensif"""
+    current_price = df["close"].iloc[-1]
+    price_change = ((current_price - df["open"].iloc[0]) / df["open"].iloc[0]) * 100
+    volume_avg = df["volume"].rolling(20).mean().iloc[-1]
+    volume_current = df["volume"].iloc[-1]
+    volume_ratio = (volume_current / volume_avg) if volume_avg > 0 else 1
+    
+    # Header dengan emoji berdasarkan signal
+    signal_emoji = {
+        "STRONG BUY": "🚀",
+        "BUY": "📈",
+        "HOLD": "⏸️",
+        "SELL": "📉",
+        "STRONG SELL": "🔻"
+    }
+    
+    emoji = signal_emoji.get(signal_data['recommendation'], "📊")
+    
+    notification = f"""
+{emoji} <b>RUAS TRADING ANALYSIS</b> {emoji}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 <b>ASSET:</b> {symbol}
+⏰ <b>TIMEFRAME:</b> {timeframe}
+🕒 <b>TIMESTAMP:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+📊 <b>TRADING RECOMMENDATION:</b>
+├ Signal: <b>{signal_data['recommendation']}</b>
+├ Strength: {get_signal_strength_bar(signal_data['signal_strength'])}
+├ Entry Zone: <code>{current_price:.6f}</code>"""
+    
+    if signal_data['tp_levels']:
+        notification += f"\n├ Take Profit 1: <code>{signal_data['tp_levels'][0]:.6f}</code>"
+        if len(signal_data['tp_levels']) > 1:
+            notification += f"\n├ Take Profit 2: <code>{signal_data['tp_levels'][1]:.6f}</code>"
+    
+    if signal_data['sl_level']:
+        notification += f"\n├ Stop Loss: <code>{signal_data['sl_level']:.6f}</code>"
+    
+    notification += f"\n└ Risk/Reward: <code>{signal_data['risk_reward']}</code>"
+    
+    notification += f"""
+
+💰 <b>PRICE ACTION:</b>
+├ Current Price: <code>{current_price:.6f}</code>
+├ 24h Change: <code>{price_change:+.2f}%</code>
+├ Volume Ratio: <code>{volume_ratio:.2f}x</code>
+└ Market Structure: {ict_data['structure']}
+
+📈 <b>TECHNICAL INDICATORS:</b>
+├ RSI(14): <code>{indicators['rsi']:.2f}</code> {get_rsi_status(indicators['rsi'])}
+├ MACD: <code>{indicators['macd']:.6f}</code>
+├ MACD Signal: <code>{indicators['macd_signal']:.6f}</code>
+├ Stochastic K: <code>{indicators['stoch_k']:.2f}</code>
+├ ADX: <code>{indicators['adx']:.2f}</code>
+└ CMF: <code>{calc_cmf(df):.4f}</code>
+
+🎯 <b>PIVOT POINTS:</b>
+├ R3: <code>{pivot_levels['r3']:.6f}</code>
+├ R2: <code>{pivot_levels['r2']:.6f}</code>
+├ R1: <code>{pivot_levels['r1']:.6f}</code> 🔴
+├ PP: <code>{pivot_levels['pivot']:.6f}</code> ⚪
+├ S1: <code>{pivot_levels['s1']:.6f}</code> 🟢
+├ S2: <code>{pivot_levels['s2']:.6f}</code>
+└ S3: <code>{pivot_levels['s3']:.6f}</code>
+
+🔄 <b>FIBONACCI RETRACEMENTS:</b>
+├ 23.6%: <code>{fibs['Fibo 23.6%']:.6f}</code>
+├ 38.2%: <code>{fibs['Fibo 38.2%']:.6f}</code>
+├ 50.0%: <code>{fibs['Fibo 50.0%']:.6f}</code>
+├ 61.8%: <code>{fibs['Fibo 61.8%']:.6f}</code>
+└ 78.6%: <code>{fibs['Fibo 78.6%']:.6f}</code>
+
+🧠 <b>SMART MONEY CONCEPTS:</b>
+├ Supply Zone (20): <code>{smc_zones['supply_zone_20']:.6f}</code>
+├ Demand Zone (20): <code>{smc_zones['demand_zone_20']:.6f}</code>
+└ BOS Status: {ict_data['bos']}
+
+⚡ <b>MOMENTUM ANALYSIS:</b>
+├ Score: <code>{signal_data['momentum_score']:+.1f}/3.0</code>
+└ Signals:"""
+    
+    # Add momentum signals
+    for signal in signal_data['momentum_signals'][:5]:  # Limit to 5 signals
+        notification += f"\n   • {signal}"
+    
+    notification += f"""
+
+⚠️ <b>RISK MANAGEMENT:</b>
+├ Position Size: Max 2% of portfolio
+├ Leverage: Max 3x (Conservative)
+└ Time Horizon: {get_time_horizon(timeframe)}
+
+📝 <b>MARKET NOTES:</b>
+├ Volatility: {get_volatility_level(df)}
+├ Trend Direction: {get_trend_direction(indicators)}
+└ Support/Resistance: {get_nearest_sr(current_price, pivot_levels)}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚡ <i>Automated Analysis by RUAS-TradingBot v2.0</i>
+🤖 <i>This is not financial advice. DYOR!</i>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+    
+    return notification
+
+def get_rsi_status(rsi):
+    if rsi >= 70: return "🔴 OVERBOUGHT"
+    elif rsi <= 30: return "🟢 OVERSOLD"
+    elif rsi >= 60: return "🟡 BULLISH"
+    elif rsi <= 40: return "🟡 BEARISH"
+    else: return "⚪ NEUTRAL"
+
+def get_signal_strength_bar(strength):
+    bars = "█" * strength + "░" * (3 - strength)
+    return f"[{bars}] {strength}/3"
+
+def get_time_horizon(timeframe):
+    horizons = {
+        "1m": "Scalping (1-5 min)",
+        "5m": "Scalping (5-15 min)",
+        "15m": "Day Trading (1-4 hours)",
+        "1h": "Swing (4-24 hours)",
+        "4h": "Position (1-7 days)"
+    }
+    return horizons.get(timeframe, "Medium-term")
+
+def get_volatility_level(df):
+    # Simple ATR calculation
+    tr1 = df['high'] - df['low']
+    tr2 = abs(df['high'] - df['close'].shift())
+    tr3 = abs(df['low'] - df['close'].shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean().iloc[-1]
+    
+    price = df['close'].iloc[-1]
+    volatility_pct = (atr / price) * 100
+    
+    if volatility_pct > 5: return "🔥 VERY HIGH"
+    elif volatility_pct > 3: return "📈 HIGH"
+    elif volatility_pct > 1.5: return "📊 MODERATE"
+    else: return "😴 LOW"
+
+def get_trend_direction(indicators):
+    if indicators['ema_20'] > indicators['ema_50']:
+        return "📈 UPTREND"
+    elif indicators['ema_20'] < indicators['ema_50']:
+        return "📉 DOWNTREND"
+    else:
+        return "➡️ SIDEWAYS"
+
+def get_nearest_sr(price, pivots):
+    resistance = min([p for p in [pivots['r1'], pivots['r2'], pivots['r3']] if p > price], default=pivots['r1'])
+    support = max([p for p in [pivots['s1'], pivots['s2'], pivots['s3']] if p < price], default=pivots['s1'])
+    return f"S: {support:.6f} | R: {resistance:.6f}"
+
+def generate_analysis(symbol, timeframe="5m"):
+    """Generate komprehensif analysis"""
+    df = get_ohlcv(symbol, timeframe)
+    indicators = calc_indicators(df)
+    pivot_levels = calc_pivot(df)
+    fibs = calc_fibonacci(df)
+    smc_zones_data = smc_zones(df)
+    ict_data = ict_analysis(df)
+    signal_data = generate_trading_signal(df, indicators, pivot_levels, smc_zones_data, ict_data)
+    
+    # Format notification
+    notification = format_professional_notification(
+        symbol, timeframe, df, indicators, pivot_levels, fibs, 
+        smc_zones_data, ict_data, signal_data
     )
     
-    # Candlestick
-    fig.add_trace(
-        go.Candlestick(
-            x=df.index,
-            open=df['open'],
-            high=df['high'],
-            low=df['low'],
-            close=df['close'],
-            name='Price'
-        ),
-        row=1, col=1
-    )
-    
-    # Moving averages
-    if 'sma_20' in df.columns:
-        fig.add_trace(
-            go.Scatter(x=df.index, y=df['sma_20'], name='SMA 20', line=dict(color='orange')),
-            row=1, col=1
-        )
-    
-    if 'sma_50' in df.columns:
-        fig.add_trace(
-            go.Scatter(x=df.index, y=df['sma_50'], name='SMA 50', line=dict(color='red')),
-            row=1, col=1
-        )
-    
-    # Bollinger Bands
-    if 'bb_upper' in df.columns:
-        fig.add_trace(
-            go.Scatter(x=df.index, y=df['bb_upper'], name='BB Upper', 
-                      line=dict(color='gray', dash='dash')),
-            row=1, col=1
-        )
-        fig.add_trace(
-            go.Scatter(x=df.index, y=df['bb_lower'], name='BB Lower', 
-                      line=dict(color='gray', dash='dash'),
-                      fill='tonexty', fillcolor='rgba(128,128,128,0.1)'),
-            row=1, col=1
-        )
-    
-    # Add recommendation lines
-    if recommendation and recommendation.signal != "HOLD":
-        fig.add_hline(y=recommendation.entry_price, line=dict(color="blue", width=2), 
-                     annotation_text=f"Entry: ${recommendation.entry_price:.4f}", row=1, col=1)
-        fig.add_hline(y=recommendation.tp1, line=dict(color="green", width=1, dash="dash"), 
-                     annotation_text=f"TP1: ${recommendation.tp1:.4f}", row=1, col=1)
-        fig.add_hline(y=recommendation.tp2, line=dict(color="green", width=2, dash="dash"), 
-                     annotation_text=f"TP2: ${recommendation.tp2:.4f}", row=1, col=1)
-        fig.add_hline(y=recommendation.stop_loss, line=dict(color="red", width=2, dash="dot"), 
-                     annotation_text=f"SL: ${recommendation.stop_loss:.4f}", row=1, col=1)
-    
-    # Volume
-    colors = ['red' if close < open else 'green' for close, open in zip(df['close'], df['open'])]
-    fig.add_trace(
-        go.Bar(x=df.index, y=df['volume'], name='Volume', marker_color=colors),
-        row=2, col=1
-    )
-    
-    # RSI
-    if 'rsi' in df.columns:
-        fig.add_trace(
-            go.Scatter(x=df.index, y=df['rsi'], name='RSI', line=dict(color='purple')),
-            row=3, col=1
-        )
-        fig.add_hline(y=70, line=dict(color="red", width=1, dash="dash"), row=3, col=1)
-        fig.add_hline(y=30, line=dict(color="green", width=1, dash="dash"), row=3, col=1)
-        fig.add_hline(y=50, line=dict(color="gray", width=1), row=3, col=1)
-    
-    # MACD
-    if 'macd' in df.columns:
-        fig.add_trace(
-            go.Scatter(x=df.index, y=df['macd'], name='MACD', line=dict(color='blue')),
-            row=4, col=1
-        )
-        fig.add_trace(
-            go.Scatter(x=df.index, y=df['macd_signal'], name='Signal', line=dict(color='red')),
-            row=4, col=1
-        )
-        fig.add_trace(
-            go.Bar(x=df.index, y=df['macd_hist'], name='Histogram', marker_color='gray'),
-            row=4, col=1
-        )
-    
-    fig.update_layout(height=800, showlegend=True, xaxis_rangeslider_visible=False)
+    return df, notification, signal_data, pivot_levels, fibs
+
+# -----------------------------
+# Chart (unchanged)
+# -----------------------------
+def plot_chart(df, smc_high, smc_low, fibs, pivot, r1, s1):
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=df["time"], open=df["open"], high=df["high"],
+        low=df["low"], close=df["close"], name="Candles"
+    ))
+    fig.add_hline(y=smc_high, line=dict(color="red", dash="dash"), annotation_text="SMC Supply")
+    fig.add_hline(y=smc_low, line=dict(color="green", dash="dash"), annotation_text="SMC Demand")
+    for name, lvl in fibs.items():
+        fig.add_hline(y=lvl, line=dict(color="blue", dash="dot"), annotation_text=name)
+    fig.add_hline(y=pivot, line=dict(color="orange"), annotation_text="Pivot")
+    fig.add_hline(y=r1, line=dict(color="purple", dash="dash"), annotation_text="R1")
+    fig.add_hline(y=s1, line=dict(color="purple", dash="dash"), annotation_text="S1")
     return fig
 
-# Main Data Fetching Function
-async def get_market_data():
-    scanner = VolatilityScanner()
-    ai_engine = AITradingEngine()
+# -----------------------------
+# Telegram
+# -----------------------------
+def clean_telegram_html(text):
+    """Clean and validate HTML for Telegram"""
+    # Ensure proper HTML tags are closed and valid
+    import re
+    
+    # Remove any malformed tags
+    text = re.sub(r'<(?!/?(?:b|i|u|s|code|pre|a)[>\s])[^>]*>', '', text)
+    
+    # Ensure all tags are properly closed
+    open_tags = re.findall(r'<(b|i|u|s|code|pre)(?:\s[^>]*)?>', text)
+    close_tags = re.findall(r'</(b|i|u|s|code|pre)>', text)
+    
+    # Balance tags if needed
+    for tag in open_tags:
+        if open_tags.count(tag) > close_tags.count(tag):
+            text += f'</{tag}>'
+    
+    return text
+
+def send_telegram(msg):
+    """Send message to Telegram with better error handling"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    
+    # Clean HTML formatting
+    msg = clean_telegram_html(msg)
     
     try:
-        await scanner.initialize()
-        await ai_engine.initialize()
-        
-        # Get top volatile pairs
-        top_pairs = await scanner.get_top_volatile_pairs(10)
-        
-        recommendations = []
-        detailed_data = {}
-        
-        for pair_data in top_pairs:
-            symbol = pair_data['symbol']
+        # Split message if too long (Telegram limit 4096 chars)
+        if len(msg) > 4000:
+            # Split at line breaks to avoid cutting important info
+            lines = msg.split('\n')
+            current_chunk = ""
             
-            try:
-                # Generate recommendation
-                recommendation = await ai_engine.generate_recommendation(symbol, pair_data)
-                if recommendation:
-                    recommendations.append(recommendation)
-                
-                # Get chart data
-                klines = await ai_engine.api.get_klines(symbol, "1h", 100)
-                df = pd.DataFrame(klines, columns=[
-                    'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                    'close_time', 'quote_asset_volume', 'number_of_trades',
-                    'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-                ])
-                
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    df[col] = pd.to_numeric(df[col])
-                
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                df.set_index('timestamp', inplace=True)
-                
-                df = ai_engine.calculate_indicators(df)
-                detailed_data[symbol] = df
-                
-            except Exception as e:
-                logger.error(f"Error processing {symbol}: {e}")
-                continue
-        
-        # Send market summary to Telegram
-        if recommendations and ai_engine.telegram.enabled:
-            await ai_engine.telegram.send_message(
-                ai_engine.telegram.format_market_summary(recommendations, top_pairs)
-            )
-        
-        return top_pairs, recommendations, detailed_data
-        
-    except Exception as e:
-        logger.error(f"Error in get_market_data: {e}")
-        return [], [], {}
-    finally:
-        await scanner.cleanup()
-        await ai_engine.cleanup()
-
-# Streamlit App Configuration
-st.set_page_config(
-    page_title="AI Crypto RUAS Trading Dashboard",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Custom CSS
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 3rem;
-        font-weight: bold;
-        text-align: center;
-        background: linear-gradient(90deg, #FF6B35, #F7931E, #FFD23F);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 2rem;
-    }
-    
-    .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 1rem;
-        border-radius: 10px;
-        color: white;
-        text-align: center;
-        margin-bottom: 1rem;
-    }
-    
-    .recommendation-card {
-        border: 2px solid;
-        border-radius: 15px;
-        padding: 1.5rem;
-        margin: 1rem 0;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    }
-    
-    .bullish { border-color: #22c55e; background: rgba(34, 197, 94, 0.1); }
-    .bearish { border-color: #ef4444; background: rgba(239, 68, 68, 0.1); }
-    .neutral { border-color: #6b7280; background: rgba(107, 114, 128, 0.1); }
-    
-    .signal-badge {
-        display: inline-block;
-        padding: 0.25rem 0.75rem;
-        border-radius: 9999px;
-        font-weight: bold;
-        font-size: 0.875rem;
-    }
-    
-    .long { background-color: #22c55e; color: white; }
-    .short { background-color: #ef4444; color: white; }
-    .hold { background-color: #6b7280; color: white; }
-    
-    .stButton > button {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        border: none;
-        border-radius: 10px;
-        padding: 0.5rem 2rem;
-        font-weight: bold;
-    }
-    
-    .sidebar .sidebar-content {
-        background: linear-gradient(180deg, #667eea 0%, #764ba2 100%);
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# Initialize session state
-if 'market_data' not in st.session_state:
-    st.session_state.market_data = None
-if 'recommendations' not in st.session_state:
-    st.session_state.recommendations = []
-if 'detailed_data' not in st.session_state:
-    st.session_state.detailed_data = {}
-if 'last_update' not in st.session_state:
-    st.session_state.last_update = None
-if 'auto_refresh' not in st.session_state:
-    st.session_state.auto_refresh = False
-
-# Header
-st.markdown('<h1 class="main-header">🤖 RUAS AI Crypto Trading Dashboard</h1>', unsafe_allow_html=True)
-
-# Sidebar
-with st.sidebar:
-    st.markdown("## 🎯 Trading Controls")
-    
-    # Telegram Configuration
-    st.markdown("### 📱 Telegram Notifications")
-    telegram_enabled = st.checkbox("Enable Telegram Notifications", value=False)
-    
-    if telegram_enabled:
-        bot_token = st.text_input("Bot Token", type="password", help="Get from @BotFather")
-        chat_id = st.text_input("Chat ID", help="Your chat ID or channel ID")
-        
-        if bot_token and chat_id:
-            os.environ['TELEGRAM_BOT_TOKEN'] = bot_token
-            os.environ['TELEGRAM_CHAT_ID'] = chat_id
-            st.success("✅ Telegram configured!")
-    
-    st.markdown("---")
-    
-    # Refresh Controls
-    st.markdown("### 🔄 Data Refresh")
-    auto_refresh = st.checkbox("Auto Refresh (300s)", value=st.session_state.auto_refresh)
-    st.session_state.auto_refresh = auto_refresh
-    
-    if st.button("🔄 Refresh Data", type="primary"):
-        st.session_state.market_data = None
-        st.rerun()
-    
-    # Filter Controls
-    st.markdown("### 🎛️ Filters")
-    min_confidence = st.slider("Min Confidence", 0.0, 1.0, 0.6, 0.05)
-    signal_filter = st.selectbox("Signal Type", ["ALL", "LONG", "SHORT", "HOLD"])
-    min_volatility = st.slider("Min Volatility %", 0.0, 50.0, 5.0, 1.0)
-    
-    st.markdown("---")
-    
-    # Info
-    st.markdown("### ℹ️ Info")
-    st.info("""
-    **Features:**
-    - Real-time market scanning
-    - AI-powered recommendations
-    - Technical analysis
-    - Telegram notifications
-    - Risk management
-    """)
-    
-    if st.session_state.last_update:
-        st.success(f"Last Update: {st.session_state.last_update.strftime('%H:%M:%S')}")
-
-# Auto-refresh logic
-if auto_refresh and st.session_state.last_update:
-    time_since_update = datetime.now() - st.session_state.last_update
-    if time_since_update.seconds >= 300:
-        st.session_state.market_data = None
-        st.rerun()
-
-# Main content
-async def main():
-    # Fetch data if needed
-    if st.session_state.market_data is None:
-        with st.spinner("🔍 Scanning markets and generating AI recommendations..."):
-            try:
-                market_data, recommendations, detailed_data = await get_market_data()
-                st.session_state.market_data = market_data
-                st.session_state.recommendations = recommendations
-                st.session_state.detailed_data = detailed_data
-                st.session_state.last_update = datetime.now()
-            except Exception as e:
-                st.error(f"❌ Error fetching data: {e}")
-                return
-    
-    market_data = st.session_state.market_data
-    recommendations = st.session_state.recommendations
-    detailed_data = st.session_state.detailed_data
-    
-    if not market_data:
-        st.error("❌ No market data available")
-        return
-    
-    # Apply filters
-    filtered_recommendations = []
-    for rec in recommendations:
-        if (rec.confidence >= min_confidence and
-            (signal_filter == "ALL" or rec.signal == signal_filter)):
-            # Find corresponding market data
-            market_info = next((m for m in market_data if m['symbol'] == rec.symbol), None)
-            if market_info and market_info['volatility_score'] >= min_volatility:
-                filtered_recommendations.append(rec)
-    
-    # Key Metrics Row
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
-    with col1:
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>📊 Pairs Scanned</h3>
-            <h2>{len(market_data)}</h2>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        high_conf = len([r for r in filtered_recommendations if r.confidence > 0.7])
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>🎯 High Confidence</h3>
-            <h2>{high_conf}</h2>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col3:
-        long_signals = len([r for r in filtered_recommendations if r.signal == "LONG"])
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>🟢 LONG Signals</h3>
-            <h2>{long_signals}</h2>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col4:
-        short_signals = len([r for r in filtered_recommendations if r.signal == "SHORT"])
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>🔴 SHORT Signals</h3>
-            <h2>{short_signals}</h2>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col5:
-        avg_volatility = np.mean([pair['volatility_score'] for pair in market_data])
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>📈 Avg Volatility</h3>
-            <h2>{avg_volatility:.1f}%</h2>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    st.markdown("---")
-    
-    # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["🎯 AI Recommendations", "📊 Market Overview", "📈 Detailed Charts", "🔥 Top Volatile Pairs"])
-    
-    with tab1:
-        st.markdown("## 🤖 AI Trading Recommendations")
-        
-        if not filtered_recommendations:
-            st.warning("No recommendations match your filters.")
-        else:
-            # Sort by confidence
-            filtered_recommendations.sort(key=lambda x: x.confidence, reverse=True)
-            
-            for rec in filtered_recommendations:
-                # Get market data for this symbol
-                market_info = next((m for m in market_data if m['symbol'] == rec.symbol), {})
-                
-                # Determine card style
-                if rec.signal == "LONG":
-                    card_class = "bullish"
-                    signal_class = "long"
-                    signal_emoji = "🟢"
-                elif rec.signal == "SHORT":
-                    card_class = "bearish"
-                    signal_class = "short"
-                    signal_emoji = "🔴"
-                else:
-                    card_class = "neutral"
-                    signal_class = "hold"
-                    signal_emoji = "🟡"
-                
-                st.markdown(f"""
-                <div class="recommendation-card {card_class}">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
-                        <h3>{signal_emoji} {rec.symbol}</h3>
-                        <span class="signal-badge {signal_class}">{rec.signal}</span>
-                    </div>
-                    
-                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1rem; margin-bottom: 1rem;">
-                        <div><strong>Confidence:</strong> {rec.confidence:.1%}</div>
-                        <div><strong>Entry:</strong> ${rec.entry_price:.4f}</div>
-                        <div><strong>TP1:</strong> ${rec.tp1:.4f}</div>
-                        <div><strong>TP2:</strong> ${rec.tp2:.4f}</div>
-                        <div><strong>Stop Loss:</strong> ${rec.stop_loss:.4f}</div>
-                        <div><strong>R:R Ratio:</strong> {rec.risk_reward_ratio:.2f}:1</div>
-                        <div><strong>24h Change:</strong> {market_info.get('change_24h', 0):.2f}%</div>
-                        <div><strong>Volatility:</strong> {market_info.get('volatility_score', 0):.1f}%</div>
-                    </div>
-                    
-                    <div style="background: rgba(255,255,255,0.1); padding: 0.75rem; border-radius: 8px;">
-                        <strong>🧠 AI Analysis:</strong> {rec.reasoning}
-                    </div>
-                    
-                    <div style="font-size: 0.875rem; color: #6b7280; margin-top: 0.5rem;">
-                        Generated: {rec.timestamp.strftime('%Y-%m-%d %H:%M:%S')}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-    
-    with tab2:
-        st.markdown("## 📊 Market Overview")
-        
-        # Create market overview DataFrame
-        overview_data = []
-        for pair in market_data:
-            rec = next((r for r in recommendations if r.symbol == pair['symbol']), None)
-            overview_data.append({
-                'Symbol': pair['symbol'],
-                'Price': f"${pair['price']:.4f}",
-                '24h Change': f"{pair['change_24h']:.2f}%",
-                'Volatility': f"{pair['volatility_score']:.1f}%",
-                'Volume': f"{pair['volume']:,.0f}",
-                'AI Signal': rec.signal if rec else "N/A",
-                'Confidence': f"{rec.confidence:.1%}" if rec else "N/A"
-            })
-        
-        df_overview = pd.DataFrame(overview_data)
-        st.dataframe(df_overview, use_container_width=True)
-        
-        # Market heatmap
-        st.markdown("### 🔥 Volatility Heatmap")
-        fig_heatmap = go.Figure(data=go.Scatter(
-            x=[p['change_24h'] for p in market_data],
-            y=[p['volatility_score'] for p in market_data],
-            mode='markers+text',
-            text=[p['symbol'].replace('USDT', '') for p in market_data],
-            textposition="middle center",
-            marker=dict(
-                size=[p['volume']/1000000 for p in market_data],
-                color=[p['change_24h'] for p in market_data],
-                colorscale='RdYlGn',
-                showscale=True,
-                sizemode='area',
-                sizeref=2.*max([p['volume']/1000000 for p in market_data])/(40.**2),
-                sizemin=4
-            )
-        ))
-        
-        fig_heatmap.update_layout(
-            title="Price Change vs Volatility (Bubble size = Volume)",
-            xaxis_title="24h Price Change (%)",
-            yaxis_title="Volatility Score (%)",
-            height=600
-        )
-        st.plotly_chart(fig_heatmap, use_container_width=True)
-    
-    with tab3:
-        st.markdown("## 📈 Detailed Technical Analysis")
-        
-        if detailed_data:
-            selected_symbol = st.selectbox(
-                "Select Symbol for Analysis:",
-                options=list(detailed_data.keys()),
-                key="chart_selector"
-            )
-            
-            if selected_symbol and selected_symbol in detailed_data:
-                df = detailed_data[selected_symbol]
-                rec = next((r for r in recommendations if r.symbol == selected_symbol), None)
-                
-                # Create and display chart
-                fig = create_price_chart(df, selected_symbol, rec)
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Technical indicators summary
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.markdown("### 📊 Current Indicators")
-                    latest = df.iloc[-1]
-                    
-                    indicators_data = {
-                        'Indicator': ['RSI', 'MACD', 'ADX', 'CMF', 'ATR'],
-                        'Value': [
-                            f"{latest.get('rsi', 0):.1f}",
-                            f"{latest.get('macd', 0):.6f}",
-                            f"{latest.get('adx', 0):.1f}",
-                            f"{latest.get('cmf', 0):.3f}",
-                            f"{latest.get('atr', 0):.6f}"
-                        ],
-                        'Signal': [
-                            "Overbought" if latest.get('rsi', 50) > 70 else "Oversold" if latest.get('rsi', 50) < 30 else "Neutral",
-                            "Bullish" if latest.get('macd', 0) > latest.get('macd_signal', 0) else "Bearish",
-                            "Strong Trend" if latest.get('adx', 0) > 25 else "Weak Trend",
-                            "Buying Pressure" if latest.get('cmf', 0) > 0.1 else "Selling Pressure" if latest.get('cmf', 0) < -0.1 else "Neutral",
-                            "High Volatility" if latest.get('atr', 0)/latest.get('close', 1) > 0.02 else "Low Volatility"
-                        ]
-                    }
-                    
-                    df_indicators = pd.DataFrame(indicators_data)
-                    st.dataframe(df_indicators, use_container_width=True)
-                
-                with col2:
-                    if rec:
-                        st.markdown("### 🎯 AI Recommendation Details")
-                        st.json({
-                            "Symbol": rec.symbol,
-                            "Signal": rec.signal,
-                            "Confidence": f"{rec.confidence:.1%}",
-                            "Entry Price": f"${rec.entry_price:.4f}",
-                            "Take Profit 1": f"${rec.tp1:.4f}",
-                            "Take Profit 2": f"${rec.tp2:.4f}",
-                            "Stop Loss": f"${rec.stop_loss:.4f}",
-                            "Risk:Reward": f"{rec.risk_reward_ratio:.2f}:1",
-                            "Reasoning": rec.reasoning
+            for line in lines:
+                if len(current_chunk + line + '\n') > 4000:
+                    if current_chunk:
+                        response = requests.post(url, json={
+                            "chat_id": TELEGRAM_CHAT_ID, 
+                            "text": current_chunk, 
+                            "parse_mode": "HTML",
+                            "disable_web_page_preview": True
                         })
-    
-    with tab4:
-        st.markdown("## 🔥 Top Volatile Pairs")
-        
-        # Sort by volatility
-        sorted_pairs = sorted(market_data, key=lambda x: x['volatility_score'], reverse=True)
-        
-        for i, pair in enumerate(sorted_pairs[:10], 1):
-            col1, col2 = st.columns([1, 3])
+                        print(f"Telegram Response: {response.status_code}")
+                        time.sleep(1)  # Avoid rate limit
+                    current_chunk = line + '\n'
+                else:
+                    current_chunk += line + '\n'
             
-            with col1:
-                change_color = "🟢" if pair['change_24h'] > 0 else "🔴"
-                st.markdown(f"""
-                ### #{i} {change_color} {pair['symbol']}
-                **Price:** ${pair['price']:.4f}  
-                **24h:** {pair['change_24h']:.2f}%  
-                **Vol:** {pair['volatility_score']:.1f}%
-                """)
+            # Send remaining chunk
+            if current_chunk:
+                response = requests.post(url, json={
+                    "chat_id": TELEGRAM_CHAT_ID, 
+                    "text": current_chunk, 
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True
+                })
+                print(f"Telegram Response: {response.status_code}")
+        else:
+            response = requests.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID, 
+                "text": msg, 
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            })
+            print(f"Telegram Response: {response.status_code}")
             
-            with col2:
-                # Mini chart
-                if pair['symbol'] in detailed_data:
-                    df_mini = detailed_data[pair['symbol']].tail(24)  # Last 24 hours
-                    fig_mini = go.Figure()
-                    fig_mini.add_trace(go.Scatter(
-                        x=df_mini.index,
-                        y=df_mini['close'],
-                        mode='lines',
-                        line=dict(color='#00ff88' if pair['change_24h'] > 0 else '#ff4444', width=2),
-                        fill='tozeroy',
-                        fillcolor=f"rgba({'0,255,136' if pair['change_24h'] > 0 else '255,68,68'},0.1)"
-                    ))
-                    fig_mini.update_layout(
-                        height=150,
-                        margin=dict(l=0, r=0, t=0, b=0),
-                        showlegend=False,
-                        xaxis=dict(showgrid=False, showticklabels=False),
-                        yaxis=dict(showgrid=False, showticklabels=False),
-                        plot_bgcolor='rgba(0,0,0,0)',
-                        paper_bgcolor='rgba(0,0,0,0)'
-                    )
-                    st.plotly_chart(fig_mini, use_container_width=True)
-            
-            st.markdown("---")
-
-# Risk Warning
-st.markdown("---")
-st.warning("""
-⚠️ **Risk Warning**: Cryptocurrency trading involves substantial risk and may result in significant losses. 
-This AI system provides analysis and recommendations for educational purposes only. Always conduct your own research 
-and consider your financial situation before making trading decisions. Past performance does not guarantee future results.
-""")
-
-# Footer
-st.markdown("""
----
-<div style="text-align: center; color: #6b7280; padding: 1rem;">
-    <p>🤖 RUAS AI Crypto Trading Dashboard | Built with Streamlit | Real-time Binance Data</p>
-    <p>⭐ Enhanced with AI Analysis & Telegram Notifications</p>
-</div>
-""", unsafe_allow_html=True)
-
-# Run the main function
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
+            # If HTML parsing fails, try with plain text
+            if response.status_code != 200:
+                print("HTML parsing failed, trying plain text...")
+                # Remove all HTML tags for plain text fallback
+                import re
+                plain_msg = re.sub(r'<[^>]+>', '', msg)
+                response = requests.post(url, json={
+                    "chat_id": TELEGRAM_CHAT_ID, 
+                    "text": plain_msg
+                })
+                print(f"Plain text Response: {response.status_code}")
+                
     except Exception as e:
-        st.error(f"❌ Application error: {e}")
-        logger.error(f"Main application error: {e}")
+        print(f"Telegram send error: {e}")
+        # Fallback to plain text
+        try:
+            import re
+            plain_msg = re.sub(r'<[^>]+>', '', msg)
+            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": plain_msg})
+        except:
+            print("All Telegram send methods failed")
+
+def telegram_listener():
+    offset = 0
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    while True:
+        try:
+            resp = requests.get(url, params={"timeout":30, "offset":offset}).json()
+            for upd in resp.get("result", []):
+                offset = upd["update_id"]+1
+                if "message" in upd:
+                    text = upd["message"].get("text", "")
+                    if text == "/refresh":
+                        run_analysis(send_to_tg=True)
+                    elif text == "/status":
+                        status_msg = f"""
+🤖 <b>Bot Status Report</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ Status: <code>ACTIVE</code>
+⏰ Refresh Interval: <code>{REFRESH_INTERVAL//60} minutes</code>
+🕒 Last Update: <code>{datetime.now().strftime('%H:%M:%S')}</code>
+📊 Exchange: <code>Binance Futures</code>
+🔄 Auto-Analysis: <code>ENABLED</code>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Commands:
+• /refresh - Manual analysis
+• /status - This status
+• /test - Test message format
+"""
+                        send_telegram(status_msg)
+                    elif text == "/test":
+                        test_msg = f"""
+🧪 <b>Test Message Format</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ <b>Bold text works</b>
+✅ <i>Italic text works</i>  
+✅ <code>Monospace works</code>
+✅ Emojis work: 📊🚀📈📉🔥⚡
+✅ Special chars: ├─└━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+If this displays correctly, HTML formatting is working!
+"""
+                        send_telegram(test_msg)
+        except Exception as e:
+            print("TG Listener Error:", e)
+        time.sleep(2)
+
+# -----------------------------
+# Runner
+# -----------------------------
+def run_analysis(send_to_tg=False):
+    st.title("📊 RUAS Pro Multi-Pair Analysis Dashboard")
+    pairs = get_top_volatile_pairs()
+    
+    # Send summary header
+    if send_to_tg:
+        header = f"""
+🤖 <b>AUTOMATED ANALYSIS REPORT</b>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⏰ <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+📊 <b>Pairs Analyzed:</b> {len(pairs)}
+🔄 <b>Timeframe:</b> 10m
+⚡ <b>Mode:</b> Auto-Scan
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+        send_telegram(header)
+    
+    successful_analyses = 0
+    for sym in pairs:
+        try:
+            df, notification, signal_data, pivot_levels, fibs = generate_analysis(sym, "5m")
+            
+            # Streamlit display
+            st.subheader(f"{sym} - {signal_data['recommendation']}")
+            fig = plot_chart(df, 
+                           pivot_levels['r1'], pivot_levels['s1'], 
+                           fibs, pivot_levels['pivot'], 
+                           pivot_levels['r1'], pivot_levels['s1'])
+            st.plotly_chart(fig, use_container_width=True)
+            st.text(notification)
+            
+            # Send to Telegram only for strong signals or BUY/SELL
+            if send_to_tg and signal_data['recommendation'] in ['STRONG BUY', 'STRONG SELL', 'BUY', 'SELL']:
+                send_telegram(notification)
+                successful_analyses += 1
+                time.sleep(300)  # Avoid rate limiting
+                
+        except Exception as e:
+            error_msg = f"❌ <b>Error analyzing {sym}:</b> {str(e)}"
+            st.error(error_msg)
+            print(f"Error analyzing {sym}: {e}")
+    
+    # Send summary footer
+    if send_to_tg:
+        footer = f"""
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 <b>ANALYSIS COMPLETE</b>
+✅ <b>Signals Sent:</b> {successful_analyses}
+⏰ <b>Next Scan:</b> {REFRESH_INTERVAL//180} minutes
+🤖 <b>Bot Version:</b> v2.0 RUAS Pro
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+        send_telegram(footer)
+
+# -----------------------------
+# Main
+# -----------------------------
+if __name__=="__main__":
+    threading.Thread(target=telegram_listener, daemon=True).start()
+    while True:
+        run_analysis(send_to_tg=True)
+        time.sleep(REFRESH_INTERVAL)
